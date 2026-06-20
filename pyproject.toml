@@ -11,9 +11,13 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-api = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2"]
+api = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2", "python-multipart>=0.0.9", "pillow>=10"]
 gpu = ["torch>=2.1", "gsplat>=1.0"]
-gen = ["torch>=2.1", "diffusers>=0.27", "transformers>=4.38"]
+gen = [
+    "torch>=2.1", "diffusers>=0.27", "transformers>=4.38", "accelerate>=0.28",
+    "safetensors>=0.4", "huggingface_hub>=0.23", "einops>=0.7", "kiui>=0.2",
+    "bitsandbytes>=0.43", "pillow>=10",
+]
 viz = ["umap-learn>=0.5"]
 dev = ["pytest>=8", "pytest-timeout>=2"]
 

@@ -16,18 +16,27 @@ Run::
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import struct
 import time
 import uuid
 import zlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 try:
-    from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+    from fastapi import (
+        FastAPI,
+        File,
+        HTTPException,
+        Response,
+        UploadFile,
+        WebSocket,
+        WebSocketDisconnect,
+    )
     from fastapi.responses import HTMLResponse
     from pydantic import BaseModel, Field
 except Exception as exc:  # pragma: no cover - api extra not installed
@@ -36,11 +45,16 @@ except Exception as exc:  # pragma: no cover - api extra not installed
     ) from exc
 
 from atanor_core import build_default_engine
+from atanor_core.deformation.fourier import FourierDeformer
 from atanor_core.domain.sgf import GaussianField, sh_dc_to_rgb
 from atanor_core.llm.heuristic import HeuristicLLM, detect_shape, sample_graph
 from atanor_core.llm.ollama import OllamaClient, list_models
 from atanor_core.state.machine import HoloState
 from atanor_core.state.rasterizer import default_intrinsics, orbit_camera
+
+# Real LGM image->3D is opt-in (needs CUDA + the `gen` extra + weights).
+_USE_LGM = os.environ.get("SPLATRA_LGM", "0") == "1"
+_lgm_gen = None  # lazy singleton
 
 app = FastAPI(title="atanor-hologram-core", version="0.1.0")
 
@@ -296,6 +310,8 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 # UI + introspection
 # --------------------------------------------------------------------------- #
 @app.get("/", response_class=HTMLResponse)
+@app.get("/studio.html", response_class=HTMLResponse)
+@app.get("/studio", response_class=HTMLResponse)
 def index() -> str:
     path = os.path.join(_VIEWER_DIR, "studio.html")
     with open(path, "r", encoding="utf-8") as f:
@@ -329,49 +345,67 @@ def get_state() -> Dict[str, Any]:
 # This is the PRD §1.2 design — heavy buffers go to the LOCAL viewer on a side
 # channel (never to the LLM). The browser renders real 3D from this.
 # --------------------------------------------------------------------------- #
-def _cartridge_arrays():
-    """Build (pos[N,3], col[N,3], size[N], opa[N]) float32 for the viewer.
+def _iso(scale: float, n: int) -> np.ndarray:
+    return np.tile(np.array([scale, scale, scale], np.float32), (n, 1))
 
-    Objects ship their dense field as-is. Graphs are densified for the viewer
-    only (render-time): each node gets a particle halo and each edge a strand,
-    so the knowledge graph reads as a rich particle hologram too.
+
+def _ident_quat(n: int) -> np.ndarray:
+    q = np.zeros((n, 4), np.float32)
+    q[:, 0] = 1.0
+    return q
+
+
+def _cartridge_arrays():
+    """Build (pos[N,3], col[N,3], scale[N,3] linear, quat[N,4], opa[N]) float32.
+
+    Carries full anisotropy (per-splat ellipsoid scale + rotation) so the WebGL
+    viewer can do real anisotropic 3DGS. Objects ship their dense oriented-surfel
+    field as-is. Graphs are densified for the viewer only (render-time): each node
+    gets an isotropic particle halo and each edge an isotropic strand.
     """
     f = _engine.field
     pos = f.means.astype(np.float32)
     col = np.clip(sh_dc_to_rgb(f.sh[:, 0, :]), 0.0, 1.0).astype(np.float32)
-    size = np.exp(f.scales).mean(axis=1).astype(np.float32)
+    scale = np.exp(f.scales).astype(np.float32)        # log -> linear [N,3]
+    quat = f.quats.astype(np.float32)                   # [N,4] (w,x,y,z)
     opa = (1.0 / (1.0 + np.exp(-f.opacities))).astype(np.float32)
 
     if not _engine._edges:
-        return pos, col, size, opa  # generated object: already dense
+        return pos, col, scale, quat, opa               # generated object
 
     rng = np.random.default_rng(7)
-    P = [pos]; C = [col]; S = [size * 1.5]; O = [np.clip(opa, 0.6, 1.0)]
+    iso = np.exp(f.scales).mean(axis=1).astype(np.float32)  # node radius proxy
+    P = [pos]; C = [col]; S = [scale * 1.5]; Q = [quat]; O = [np.clip(opa, 0.6, 1.0)]
     K = 130  # halo particles per node
     for i in range(pos.shape[0]):
-        sig = max(float(size[i]) * 1.6, 0.03)
+        sig = max(float(iso[i]) * 1.6, 0.03)
         P.append(pos[i] + rng.normal(0, sig, size=(K, 3)).astype(np.float32))
         C.append(np.repeat(col[i][None, :], K, 0))
-        S.append(np.full(K, float(size[i]) * 0.5, np.float32))
+        S.append(_iso(float(iso[i]) * 0.5, K))
+        Q.append(_ident_quat(K))
         O.append(np.full(K, 0.22, np.float32))
     M = 26  # samples per edge strand
     s = np.linspace(0.06, 0.94, M, dtype=np.float32)[:, None]
     for a, b in _engine._edges:
         P.append((pos[a][None] * (1 - s) + pos[b][None] * s).astype(np.float32))
         C.append((col[a][None] * (1 - s) + col[b][None] * s).astype(np.float32))
-        S.append(np.full(M, 0.011, np.float32))
+        S.append(_iso(0.011, M))
+        Q.append(_ident_quat(M))
         O.append(np.full(M, 0.5, np.float32))
-    return (np.concatenate(P, 0), np.concatenate(C, 0),
-            np.concatenate(S, 0), np.concatenate(O, 0))
+    return (np.concatenate(P, 0), np.concatenate(C, 0), np.concatenate(S, 0),
+            np.concatenate(Q, 0), np.concatenate(O, 0))
 
 
-def _pack_cartridge(pos, col, size, opa) -> bytes:
+def _pack_cartridge(pos, col, scale, quat, opa) -> bytes:
+    # magic "SPL2" + uint32 N, then pos[N*3] col[N*3] scale[N*3] quat[N*4] opa[N]
     n = int(pos.shape[0])
     return (
-        struct.pack("<I", n)
+        b"SPL2"
+        + struct.pack("<I", n)
         + np.ascontiguousarray(pos, np.float32).tobytes()
         + np.ascontiguousarray(col, np.float32).tobytes()
-        + np.ascontiguousarray(size, np.float32).tobytes()
+        + np.ascontiguousarray(scale, np.float32).tobytes()
+        + np.ascontiguousarray(quat, np.float32).tobytes()
         + np.ascontiguousarray(opa, np.float32).tobytes()
     )
 
@@ -383,6 +417,87 @@ def cartridge() -> Response:
     blob = _pack_cartridge(*_cartridge_arrays())
     return Response(content=blob, media_type="application/octet-stream",
                     headers={"Cache-Control": "no-store"})
+
+
+# --------------------------------------------------------------------------- #
+# Image -> 3D (real LGM path, with an honest procedural fallback).
+# --------------------------------------------------------------------------- #
+def _decode_image(raw: bytes) -> Optional[np.ndarray]:
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(raw)).convert("RGB").resize((256, 256))
+        return np.asarray(im, dtype=np.float32) / 255.0
+    except Exception:
+        return None
+
+
+def _dominant_color(img: np.ndarray) -> Tuple[float, float, float]:
+    c = img.reshape(-1, 3).mean(axis=0)
+    m = float(c.max())
+    c = (c / m * 0.9) if m > 1e-3 else np.array([0.5, 0.6, 0.9], dtype=np.float32)
+    return tuple(np.clip(c, 0.14, 1.0).tolist())
+
+
+def _color_mv(color) -> np.ndarray:
+    img = np.zeros((1, 4, 3, 8, 8), dtype=np.float32)
+    for ch in range(3):
+        img[:, :, ch, :, :] = color[ch]
+    return img
+
+
+def _display_field(name: str, field: GaussianField, verified: bool = True) -> None:
+    """Hot-swap a ready field into the engine + pin it as a cartridge."""
+    _engine.field = field
+    _engine.deformer = FourierDeformer(field.means)
+    _engine._edges = []
+    cart = _engine.compressor.compress(name, field)
+    cart.verified = verified
+    _engine.cache[name] = cart
+    _engine.state = HoloState.DISPLAYED
+
+
+def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, GaussianField]:
+    """Return (engine_label, note, field). Real LGM if enabled+available, else
+    an honest procedural placeholder tinted by the image's dominant color."""
+    global _lgm_gen
+    if _USE_LGM and img is not None:
+        try:
+            if _lgm_gen is None:
+                from atanor_core.generation.lgm import LGMGenerator
+
+                _lgm_gen = LGMGenerator()
+            field = _lgm_gen.from_image(img)
+            return ("lgm", "Reconstructed with LGM (image → 4-view diffusion → "
+                    "LGM U-Net → 3DGS).", field)
+        except Exception as exc:  # NotImplemented (no GPU/weights) or runtime
+            note = (f"LGM unavailable ({type(exc).__name__}: {str(exc)[:140]}). "
+                    "Showing a procedural placeholder. Enable on a CUDA box: "
+                    "pip install -e '.[gen]' and SPLATRA_LGM=1.")
+    else:
+        note = ("LGM image→3D is disabled (set SPLATRA_LGM=1 on a CUDA box with "
+                "the .[gen] extra). Showing a procedural placeholder tinted by "
+                "your image — honest mock, not a reconstruction.")
+    color = _dominant_color(img) if img is not None else (0.6, 0.6, 0.7)
+    field = _engine.generator.generate(_color_mv(color), cam_rays={"shape": "sphere"})
+    return ("mock(procedural)", note, field)
+
+
+@app.post("/v1/generate_from_image")
+async def generate_from_image(image: UploadFile = File(...)) -> Dict[str, Any]:
+    raw = await image.read()
+    img = _decode_image(raw)
+    name = _slug(image.filename or "image") or "image"
+    engine_label, note, field = _image_to_field(name, img)
+    _display_field(name, field)
+    return {
+        "status": "displayed",
+        "engine": engine_label,
+        "note": note,
+        "name": name,
+        "state": _engine.state.value,
+        "sgf": _sgf_summary(field),
+    }
 
 
 @app.get("/v1/frame")

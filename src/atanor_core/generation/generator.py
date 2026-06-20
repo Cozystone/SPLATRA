@@ -93,6 +93,29 @@ def _cube(n: int, r: float):
 _SHAPES = {"sphere": _sphere, "cube": _cube, "torus": _torus, "spiral": _spiral}
 
 
+def _quat_from_normal(n: np.ndarray) -> np.ndarray:
+    """[N,3] surface normals -> [N,4] quaternions mapping local +z onto n.
+
+    Produces oriented surfels: the splat's thin axis (local z) aligns with the
+    surface normal, so the Gaussian becomes a flat disk tangent to the surface.
+    """
+    n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
+    N = n.shape[0]
+    z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    dotv = np.clip(n[:, 2], -1.0, 1.0)            # z . n
+    axis = np.cross(np.broadcast_to(z, (N, 3)), n)  # z x n
+    an = np.linalg.norm(axis, axis=1, keepdims=True)
+    axis = np.where(an < 1e-6, np.array([1.0, 0.0, 0.0], dtype=np.float32), axis / np.maximum(an, 1e-8))
+    half = np.arccos(dotv) * 0.5
+    s = np.sin(half)
+    q = np.empty((N, 4), dtype=np.float32)
+    q[:, 0] = np.cos(half)
+    q[:, 1] = axis[:, 0] * s
+    q[:, 2] = axis[:, 1] * s
+    q[:, 3] = axis[:, 2] * s
+    return q
+
+
 class MockGenerator:
     """MOCK generator: procedural shaded shape (deterministic). Not real 3D recon."""
 
@@ -131,9 +154,12 @@ class MockGenerator:
         lambert = 0.35 + 0.65 * np.clip(normals @ _LIGHT, 0.0, 1.0)  # [N]
         colors = np.clip(base_rgb[None, :] * lambert[:, None], 0.0, 1.0).astype(np.float32)
 
-        scales = np.log(np.full((n, 3), 0.028, dtype=np.float32))
-        quats = np.zeros((n, 4), dtype=np.float32)
-        quats[:, 0] = 1.0
+        # Anisotropic surfels: wide in the tangent plane, thin along the normal,
+        # oriented by a quaternion that maps local +z onto the surface normal.
+        scales = np.log(
+            np.tile(np.array([0.05, 0.05, 0.013], dtype=np.float32), (n, 1))
+        )
+        quats = _quat_from_normal(normals)
         opacities = np.full((n,), 3.0, dtype=np.float32)  # logit -> ~0.95
 
         k = (self.sh_degree + 1) ** 2

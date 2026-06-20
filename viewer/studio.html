@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ATANOR Hologram Studio</title>
+<title>ATANOR Hologram Studio — anisotropic 3DGS</title>
 <style>
   :root {
     --bg:#06080f; --panel:#0c1018; --line:#1b2433; --ink:#cfe6ff;
@@ -16,10 +16,8 @@
     color:var(--ink); font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     display:flex; flex-direction:column; height:100vh; overflow:hidden;
   }
-  header {
-    display:flex; align-items:center; gap:14px; padding:10px 16px;
-    border-bottom:1px solid var(--line); background:rgba(10,14,22,.7); backdrop-filter:blur(6px);
-  }
+  header { display:flex; align-items:center; gap:14px; padding:10px 16px;
+    border-bottom:1px solid var(--line); background:rgba(10,14,22,.7); backdrop-filter:blur(6px); }
   header h1 { font-size:14px; margin:0; letter-spacing:.5px; }
   header h1 b { color:var(--accent); }
   .tag { font-size:11px; color:var(--muted); }
@@ -38,8 +36,9 @@
   #sgf { top:14px; left:16px; background:#0a0e16cc; border:1px solid var(--line);
          border-radius:8px; padding:8px 10px; white-space:pre; }
   #hint { bottom:14px; left:16px; }
+  #fps { bottom:14px; right:16px; color:var(--accent); }
   #tools { position:absolute; top:12px; right:14px; display:flex; flex-wrap:wrap; gap:6px;
-           justify-content:flex-end; max-width:60%; }
+           justify-content:flex-end; max-width:62%; }
   .ctl { background:#0a0e16; color:var(--ink); border:1px solid var(--line);
          border-radius:8px; padding:6px 10px; cursor:pointer; font-family:inherit; }
   .ctl:hover { border-color:var(--accent2); }
@@ -47,7 +46,7 @@
   #tools .ctl { font-size:11px; padding:5px 9px; }
   .slider { display:flex; align-items:center; gap:6px; background:#0a0e16; border:1px solid var(--line);
             border-radius:8px; padding:3px 8px; color:var(--muted); }
-  .slider input { width:80px; }
+  .slider input { width:74px; }
 
   #side { flex:1; min-width:340px; max-width:440px; display:flex; flex-direction:column; background:var(--panel); }
   #log { flex:1; overflow:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
@@ -61,7 +60,7 @@
   .quick { display:flex; flex-wrap:wrap; gap:6px; padding:8px 12px 0; }
   .quick .ctl { font-size:11px; padding:5px 9px; color:var(--muted); }
   form { display:flex; gap:8px; padding:12px; border-top:1px solid var(--line); }
-  #model { max-width:150px; }
+  #model { max-width:140px; }
   #msg { flex:1; background:#0a0e16; color:var(--ink); border:1px solid var(--line);
          border-radius:10px; padding:9px 12px; outline:none; }
   #msg:focus { border-color:var(--accent); }
@@ -69,16 +68,18 @@
           font-weight:700; padding:0 16px; border-radius:10px; cursor:pointer; }
   #send:disabled { opacity:.5; cursor:default; }
   .note { font-size:10px; color:var(--muted); padding:0 12px 10px; }
+  #drop { font-size:11px; color:var(--muted); padding:0 12px 6px; }
+  #drop b { color:var(--accent2); cursor:pointer; text-decoration:underline; }
 </style>
 </head>
 <body>
 <header>
   <h1><b>ATANOR</b> Hologram Studio</h1>
-  <span class="tag">local LLM → WebGL Gaussian hologram</span>
+  <span class="tag">anisotropic 3DGS · depth-sorted · local-LLM</span>
   <div class="badge">
     <span class="pill">engine <b id="enginePill">heuristic</b></span>
-    <span class="pill" id="modelPill">ollama: checking…</span>
-    <span class="pill" id="countPill">0 particles</span>
+    <span class="pill" id="modelPill">ollama: …</span>
+    <span class="pill" id="countPill">0 splats</span>
     <span class="pill" id="statePill">IDLE</span>
   </div>
 </header>
@@ -91,19 +92,19 @@
       <button class="ctl" id="spin">▶ spin</button>
       <button class="ctl" id="reassemble">⟳ reassemble</button>
       <button class="ctl" id="cycle">∞ auto-cycle</button>
-      <label class="slider">size <input id="sizeR" type="range" min="0.4" max="3" step="0.1" value="1.3"></label>
+      <label class="slider">size <input id="sizeR" type="range" min="0.4" max="2.4" step="0.1" value="1.0"></label>
     </div>
-    <div id="hint" class="overlay">drag = orbit · scroll = zoom · right-drag / shift-drag = pan · real 3D, rendered in your browser</div>
+    <div id="hint" class="overlay">drag = orbit · scroll = zoom · right/shift-drag = pan · real anisotropic 3DGS on your GPU</div>
+    <div id="fps" class="overlay"></div>
   </section>
 
   <section id="side">
     <div id="log">
       <div class="msg bot"><span class="eng">system</span><br>
-        Type what to build — it becomes a real 3D Gaussian hologram you can orbit.
-        Try the quick buttons, or “a glowing knowledge graph with 30 nodes”,
-        “generate a blue torus”, “make a red spiral”. Pick an Ollama model above
-        to drive it with your local LLM. Use ⟳ / ∞ to watch the particles
-        disassemble and reassemble.</div>
+        Real-time anisotropic Gaussian splatting. Type a prompt to build a 3D
+        hologram you can orbit, or <b>drop an image</b> below to reconstruct it
+        with the LGM image→3D pipeline (GPU). Try: “a glowing knowledge graph of
+        30 nodes”, “generate a blue torus”, “make a gold spiral”.</div>
     </div>
     <div class="quick">
       <button class="ctl" data-q="show a knowledge graph with 30 nodes">graph ×30</button>
@@ -112,159 +113,249 @@
       <button class="ctl" data-q="generate a gold spiral">gold spiral</button>
       <button class="ctl" data-q="a green sphere">green sphere</button>
     </div>
+    <div id="drop">image→3D (LGM): <b id="pick">choose / drop an image</b>
+      <input id="file" type="file" accept="image/*" style="display:none" /></div>
     <form id="chat">
       <select id="model" class="ctl"><option value="heuristic">heuristic (no LLM)</option></select>
       <input id="msg" placeholder="describe a hologram…" autocomplete="off" />
       <button id="send" type="submit">Send</button>
     </form>
     <div class="note">No raw 3D buffers go to the LLM — only SGF summaries + a cartridge
-      handle. The viewer pulls the Gaussian buffer on a side channel (/v1/cartridge)
-      and renders it locally on the GPU.</div>
+      handle. The viewer pulls the Gaussian buffer (/v1/cartridge) and rasterizes
+      it locally with full anisotropic covariance + back-to-front depth sorting.</div>
   </section>
 </main>
 
 <script>
 const API = location.origin;
-// ----------------------------------------------------------------- WebGL ----
 const canvas = document.getElementById("gl");
-const gl = canvas.getContext("webgl2", { antialias: true, premultipliedAlpha: true });
-if (!gl) document.getElementById("hint").textContent = "WebGL2 not available in this browser.";
+const gl = canvas.getContext("webgl2", { antialias:false, premultipliedAlpha:true, alpha:false });
+if (!gl) document.getElementById("hint").textContent = "WebGL2 not available.";
 
+// ============================================================= shaders =====
 const VERT = `#version 300 es
-in vec3 aHome; in vec3 aScatter; in vec3 aColor; in float aSize; in float aOpa;
-uniform mat4 uProj, uView; uniform float uT, uPx, uSize;
-out vec3 vColor; out float vOpa;
-void main() {
-  float e = uT * uT * (3.0 - 2.0 * uT);            // smoothstep assemble factor
-  vec3 pos = mix(aScatter, aHome, e);
-  float ang = (1.0 - e) * 2.6;                      // swirl that unwinds as it forms
-  float ca = cos(ang), sa = sin(ang);
-  pos.xz = mat2(ca, -sa, sa, ca) * pos.xz;
-  vec4 cam = uView * vec4(pos, 1.0);
-  gl_Position = uProj * cam;
-  float d = max(-cam.z, 0.05);
-  gl_PointSize = clamp(aSize * uPx * uSize / d, 1.0, 56.0);
-  vColor = aColor; vOpa = aOpa;
-}`;
-const FRAG = `#version 300 es
-precision mediump float;
-in vec3 vColor; in float vOpa; out vec4 frag;
-void main() {
-  vec2 d = gl_PointCoord - 0.5;
-  float r2 = dot(d, d) * 4.0;
-  if (r2 > 1.0) discard;
-  float a = exp(-2.8 * r2) * vOpa;                  // soft gaussian splat
-  frag = vec4(vColor * a, a);                       // premultiplied "over"
+precision highp float; precision highp int;
+layout(location=0) in vec2 aCorner;     // quad corner in {-1,1}
+layout(location=1) in uint aIndex;       // sorted splat index (back-to-front)
+uniform sampler2D uData; uniform int uTexW;
+uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
+uniform float uT, uSizeScale;
+out vec3 vColor; out float vOpacity; out vec2 vQuad;
+
+vec4 texel(int p){ return texelFetch(uData, ivec2(p % uTexW, p / uTexW), 0); }
+vec3 hash3(vec3 p){ p = fract(p*vec3(443.897,441.423,437.195)); p += dot(p, p.yzx+19.19); return fract((p.xxy+p.yzz)*p.zyx); }
+
+void main(){
+  int base = int(aIndex)*4;
+  vec4 t0 = texel(base), t1 = texel(base+1), t2 = texel(base+2), t3 = texel(base+3);
+  vec3 home = t0.xyz; float opacity = t0.w; vec3 color = t1.xyz;
+
+  // assemble/disassemble morph: scatter <-> home with an unwinding swirl
+  float e = uT*uT*(3.0-2.0*uT);
+  vec3 h = hash3(home + 0.123);
+  vec3 dir = normalize(home + vec3(1e-4));
+  vec3 scatter = home + dir*(0.8 + 1.4*h.x) + (h-0.5)*1.7;
+  vec3 pos = mix(scatter, home, e);
+  float ang = (1.0-e)*2.6; float ca = cos(ang), sa = sin(ang);
+  pos.xz = mat2(ca,-sa,sa,ca) * pos.xz;
+
+  vec4 cam = uView * vec4(pos,1.0);
+  if (cam.z >= -0.05) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; } // behind camera
+  vec4 clip = uProj * cam;
+
+  // anisotropic 3D covariance (packed) -> projected 2D covariance (EWA)
+  float ss = uSizeScale*uSizeScale;
+  mat3 Vrk = mat3(t2.x,t2.y,t2.z,  t2.y,t3.x,t3.y,  t2.z,t3.y,t3.z) * ss;
+  float zc = cam.z;
+  mat3 J = mat3(uFocal.x/zc, 0.0, -uFocal.x*cam.x/(zc*zc),
+                0.0, uFocal.y/zc, -uFocal.y*cam.y/(zc*zc),
+                0.0, 0.0, 0.0);
+  mat3 W = mat3(uView);
+  mat3 Tm = J * W;
+  mat3 cov = Tm * Vrk * transpose(Tm);
+  float a = cov[0][0] + 0.3, b = cov[0][1], c = cov[1][1] + 0.3;   // +lowpass
+  float det = a*c - b*b;
+  if (det <= 0.0) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
+
+  // eigen-decomposition of the 2x2 cov -> screen-space ellipse axes (3 sigma)
+  float mid = 0.5*(a+c);
+  float rad = sqrt(max(mid*mid - det, 0.0));
+  float l1 = mid + rad, l2 = max(mid - rad, 0.1);
+  vec2 e1 = normalize(vec2(b, l1 - a));
+  vec2 e2 = vec2(e1.y, -e1.x);
+  vec2 major = min(3.0*sqrt(l1), 256.0) * e1;
+  vec2 minor = min(3.0*sqrt(l2), 256.0) * e2;
+
+  vColor = color; vOpacity = opacity; vQuad = aCorner;
+  vec2 ndc = clip.xy / clip.w;
+  vec2 offset = (aCorner.x*major + aCorner.y*minor) * 2.0 / uViewport;
+  gl_Position = vec4(ndc + offset, clip.z/clip.w, 1.0);
 }`;
 
-function compile(type, src) {
-  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
-  return s;
-}
+const FRAG = `#version 300 es
+precision highp float;
+in vec3 vColor; in float vOpacity; in vec2 vQuad; out vec4 frag;
+void main(){
+  float r2 = dot(vQuad, vQuad);          // {-1,1} quad; ellipse at r2<=1 (3 sigma)
+  if (r2 > 1.0) discard;
+  float alpha = vOpacity * exp(-4.5 * r2);   // gaussian falloff (corner=3 sigma)
+  if (alpha < 0.004) discard;
+  frag = vec4(vColor * alpha, alpha);        // premultiplied -> over-blend
+}`;
+
+function compile(t,s){ const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh);
+  if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(sh); return sh; }
 const prog = gl.createProgram();
 gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
 gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
-gl.linkProgram(prog); gl.useProgram(prog);
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
+gl.useProgram(prog);
 
-const loc = {};
-["aHome","aScatter","aColor","aSize","aOpa"].forEach(a => loc[a] = gl.getAttribLocation(prog, a));
-["uProj","uView","uT","uPx","uSize"].forEach(u => loc[u] = gl.getUniformLocation(prog, u));
-const buf = { aHome: gl.createBuffer(), aScatter: gl.createBuffer(),
-              aColor: gl.createBuffer(), aSize: gl.createBuffer(), aOpa: gl.createBuffer() };
-let COUNT = 0;
+const U = {};
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
-function bindAttr(name, size) {
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf[name]);
-  gl.enableVertexAttribArray(loc[name]);
-  gl.vertexAttribPointer(loc[name], size, gl.FLOAT, false, 0, 0);
-}
+// quad corners (triangle strip) + per-instance index buffer
+const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+const cornerBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+const idxBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
+gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1,1,gl.UNSIGNED_INT,0,0); gl.vertexAttribDivisor(1,1);
+const dataTex = gl.createTexture();
+let COUNT = 0, TEXW = 2048, homePos = null, order = null, depths = null;
 
-// --------------------------------------------------------------- mat math ----
-function perspective(fovy, aspect, near, far) {
-  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+// ============================================================= math =========
+function perspective(fovy, aspect, near, far){
+  const f=1/Math.tan(fovy/2), nf=1/(near-far);
   return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0];
 }
-function lookAt(eye, ctr, up) {
-  const z = norm(sub(eye, ctr)), x = norm(cross(up, z)), y = cross(z, x);
-  return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
-          -dot(x,eye),-dot(y,eye),-dot(z,eye),1];
+function lookAt(eye, ctr, up){
+  const z=norm(sub(eye,ctr)), x=norm(cross(up,z)), y=cross(z,x);
+  return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,eye),-dot(y,eye),-dot(z,eye),1];
 }
 const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
 const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
 const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
-const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/l,a[1]/l,a[2]/l];};
+const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l];};
 
-// ----------------------------------------------------------------- camera ----
-let yaw=0.7, pitch=0.4, dist=3.4, target=[0,0,0];
-let sizeScale=1.3, autospin=false;
+// ============================================================= camera =======
+let yaw=0.7, pitch=0.4, dist=3.4, target=[0,0,0], sizeScale=1.0, autospin=false;
+const anim = { t:1, mode:"idle", from:1, to:1, t0:0, dur:1400 };
+function tween(to,dur=1400){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; }
 
-function resize() {
-  const dpr = Math.min(devicePixelRatio||1, 2);
-  let w = canvas.clientWidth*dpr|0, h = canvas.clientHeight*dpr|0;
-  if (w < 10) w = 800; if (h < 10) h = 600;   // fallback if layout reports 0
-  if (canvas.width!==w || canvas.height!==h){ canvas.width=w; canvas.height=h; }
+function resize(){
+  const dpr=Math.min(devicePixelRatio||1,2);
+  let w=canvas.clientWidth*dpr|0, h=canvas.clientHeight*dpr|0;
+  if(w<10)w=900; if(h<10)h=650;
+  if(canvas.width!==w||canvas.height!==h){ canvas.width=w; canvas.height=h; }
 }
 
-function draw() {
+// ====================================================== covariance / upload =
+function uploadModel(pos, col, scale, quat, opa){
+  const n = opa.length;
+  const texH = Math.ceil(n*4 / TEXW);
+  const tex = new Float32Array(TEXW * texH * 4);
+  for (let i=0;i<n;i++){
+    // normalize quaternion (w,x,y,z)
+    let w=quat[4*i], x=quat[4*i+1], y=quat[4*i+2], z=quat[4*i+3];
+    const ql=Math.hypot(w,x,y,z)||1; w/=ql; x/=ql; y/=ql; z/=ql;
+    const sx=scale[3*i], sy=scale[3*i+1], sz=scale[3*i+2];
+    // rotation matrix
+    const r00=1-2*(y*y+z*z), r01=2*(x*y-w*z), r02=2*(x*z+w*y);
+    const r10=2*(x*y+w*z),   r11=1-2*(x*x+z*z), r12=2*(y*z-w*x);
+    const r20=2*(x*z-w*y),   r21=2*(y*z+w*x),   r22=1-2*(x*x+y*y);
+    const sx2=sx*sx, sy2=sy*sy, sz2=sz*sz;
+    // Sigma = R S^2 R^T (6 unique)
+    const c00=r00*r00*sx2 + r01*r01*sy2 + r02*r02*sz2;
+    const c01=r00*r10*sx2 + r01*r11*sy2 + r02*r12*sz2;
+    const c02=r00*r20*sx2 + r01*r21*sy2 + r02*r22*sz2;
+    const c11=r10*r10*sx2 + r11*r11*sy2 + r12*r12*sz2;
+    const c12=r10*r20*sx2 + r11*r21*sy2 + r12*r22*sz2;
+    const c22=r20*r20*sx2 + r21*r21*sy2 + r22*r22*sz2;
+    const o=i*4*4;
+    tex[o+0]=pos[3*i]; tex[o+1]=pos[3*i+1]; tex[o+2]=pos[3*i+2]; tex[o+3]=opa[i];
+    tex[o+4]=col[3*i]; tex[o+5]=col[3*i+1]; tex[o+6]=col[3*i+2]; tex[o+7]=0;
+    tex[o+8]=c00; tex[o+9]=c01; tex[o+10]=c02; tex[o+11]=0;
+    tex[o+12]=c11; tex[o+13]=c12; tex[o+14]=c22; tex[o+15]=0;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, dataTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TEXW, texH, 0, gl.RGBA, gl.FLOAT, tex);
+
+  homePos = pos; COUNT = n;
+  order = new Uint32Array(n); for(let i=0;i<n;i++) order[i]=i;
+  depths = new Float32Array(n);
+  lastSortKey = "";
+  document.getElementById("countPill").textContent = n.toLocaleString() + " splats";
+}
+
+// ====================================================== depth sort (16-bit) =
+const counts = new Uint32Array(65536);
+let lastSortKey = "";
+function sortSplats(view){
+  if (!COUNT) return;
+  const m2=view[2], m6=view[6], m10=view[10], m14=view[14];
+  let zmin=1e30, zmax=-1e30;
+  for(let i=0;i<COUNT;i++){
+    const d = m2*homePos[3*i] + m6*homePos[3*i+1] + m10*homePos[3*i+2] + m14;
+    depths[i]=d; if(d<zmin)zmin=d; if(d>zmax)zmax=d;
+  }
+  // ascending d => most-negative (farthest, since cam looks -z) first => back-to-front
+  const scale = 65535 / ((zmax - zmin) || 1);
+  counts.fill(0);
+  for(let i=0;i<COUNT;i++){ counts[((depths[i]-zmin)*scale)|0]++; }
+  for(let k=1;k<65536;k++) counts[k]+=counts[k-1];
+  for(let i=COUNT-1;i>=0;i--){ const key=((depths[i]-zmin)*scale)|0; order[--counts[key]]=i; }
+  gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, order, gl.DYNAMIC_DRAW);
+}
+
+// ============================================================= render loop ==
+let frames=0, fpsT=performance.now();
+function frame(){
+  const now=performance.now();
+  if(autospin) yaw+=0.006;
+  // animation
+  if(anim.mode==="tween"){ const k=Math.min(1,(now-anim.t0)/anim.dur);
+    anim.t=anim.from+(anim.to-anim.from)*k; if(k>=1)anim.mode="idle"; }
+  else if(anim.mode==="cycle"){ const P=1400+1000+1400+700, x=(now-anim.t0)%P;
+    anim.t = x<1400 ? x/1400 : x<2400 ? 1 : x<3800 ? 1-(x-2400)/1400 : 0; }
+
   resize();
   gl.viewport(0,0,canvas.width,canvas.height);
-  gl.clearColor(0.015,0.03,0.06,1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  if (!COUNT) return;
-  // Depth-tested "over" compositing: splats form a solid, correctly-colored
-  // surface (near wins) instead of additively summing to white.
-  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
-  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0.012,0.025,0.05,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  if(COUNT){
+    const eye=[ target[0]+dist*Math.cos(pitch)*Math.sin(yaw),
+               target[1]+dist*Math.sin(pitch),
+               target[2]+dist*Math.cos(pitch)*Math.cos(yaw) ];
+    const fovy=50*Math.PI/180, asp=canvas.width/canvas.height;
+    const proj=perspective(fovy,asp,0.05,100), view=lookAt(eye,target,[0,1,0]);
 
-  const eye = [
-    target[0] + dist*Math.cos(pitch)*Math.sin(yaw),
-    target[1] + dist*Math.sin(pitch),
-    target[2] + dist*Math.cos(pitch)*Math.cos(yaw),
-  ];
-  const fovy = 50*Math.PI/180;
-  const proj = perspective(fovy, canvas.width/canvas.height, 0.05, 100);
-  const view = lookAt(eye, target, [0,1,0]);
-  gl.uniformMatrix4fv(loc.uProj, false, proj);
-  gl.uniformMatrix4fv(loc.uView, false, view);
-  gl.uniform1f(loc.uPx, 0.5*canvas.height/Math.tan(fovy/2));
-  gl.uniform1f(loc.uSize, sizeScale);
-  gl.uniform1f(loc.uT, anim.t);
-  bindAttr("aHome",3); bindAttr("aScatter",3); bindAttr("aColor",3); bindAttr("aSize",1); bindAttr("aOpa",1);
-  gl.drawArrays(gl.POINTS, 0, COUNT);
-}
+    // re-sort when the view changed enough, or while animating
+    const key = `${yaw.toFixed(3)},${pitch.toFixed(3)},${dist.toFixed(2)},${target.map(v=>v.toFixed(2))}`;
+    if(key!==lastSortKey || anim.mode!=="idle"){ sortSplats(view); lastSortKey=key; }
 
-// -------------------------------------------------------------- animation ----
-const anim = { t: 1, mode: "idle", from: 1, to: 1, t0: 0, dur: 1300 };
-function tween(to, dur=1300){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; }
-function stepAnim(now) {
-  if (anim.mode === "tween") {
-    const k = Math.min(1, (now - anim.t0) / anim.dur);
-    anim.t = anim.from + (anim.to - anim.from) * k;
-    if (k >= 1) anim.mode = "idle";
-  } else if (anim.mode === "cycle") {
-    // assemble(1.3s) → hold(1.0s) → disassemble(1.3s) → hold(0.7s) → repeat
-    const P = 1300+1000+1300+700;
-    const x = ((now - anim.t0) % P);
-    if (x < 1300) anim.t = x/1300;
-    else if (x < 2300) anim.t = 1;
-    else if (x < 3600) anim.t = 1 - (x-2300)/1300;
-    else anim.t = 0;
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(prog); gl.bindVertexArray(vao);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, dataTex);
+    gl.uniform1i(U.uData,0); gl.uniform1i(U.uTexW,TEXW);
+    gl.uniformMatrix4fv(U.uProj,false,proj); gl.uniformMatrix4fv(U.uView,false,view);
+    gl.uniform2f(U.uFocal, proj[0]*0.5*canvas.width, proj[5]*0.5*canvas.height);
+    gl.uniform2f(U.uViewport, canvas.width, canvas.height);
+    gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
   }
+  frames++;
+  if(now-fpsT>500){ document.getElementById("fps").textContent = Math.round(frames*1000/(now-fpsT))+" fps · "+COUNT.toLocaleString()+" splats"; frames=0; fpsT=now; }
 }
+window.__render = frame;
+setInterval(frame, 16);   // setInterval so a backgrounded tab keeps rendering
 
-function loop() {
-  const now = performance.now();
-  if (autospin) yaw += 0.006;
-  stepAnim(now);
-  draw();
-}
-// setInterval (not requestAnimationFrame) so a backgrounded tab keeps rendering
-// — rAF is paused when the tab isn't visible. Foreground runs at ~60fps.
-window.__render = loop;            // debug hook
-setInterval(loop, 16);
-
-// ----------------------------------------------------------------- input ----
+// ============================================================= input ========
 let drag=null;
 canvas.addEventListener("contextmenu", e=>e.preventDefault());
 canvas.addEventListener("mousedown", e=>{ drag={x:e.clientX,y:e.clientY,pan:(e.button===2||e.shiftKey)}; });
@@ -272,73 +363,45 @@ addEventListener("mouseup", ()=>drag=null);
 addEventListener("mousemove", e=>{
   if(!drag) return;
   const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
-  if(drag.pan){
-    const r=norm(cross([0,1,0],[Math.sin(yaw),0,Math.cos(yaw)]));
-    const k=dist*0.0016;
-    target[0]-=(r[0]*dx)*k; target[2]-=(r[2]*dx)*k; target[1]+=dy*k;
-  } else {
-    yaw+=dx*0.01; pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.01));
-  }
+  if(drag.pan){ const r=norm(cross([0,1,0],[Math.sin(yaw),0,Math.cos(yaw)])); const k=dist*0.0016;
+    target[0]-=r[0]*dx*k; target[2]-=r[2]*dx*k; target[1]+=dy*k; }
+  else { yaw+=dx*0.01; pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.01)); }
 });
-canvas.addEventListener("wheel", e=>{ e.preventDefault();
-  dist=Math.max(1.3,Math.min(9,dist*(1+e.deltaY*0.0012))); }, {passive:false});
-
+canvas.addEventListener("wheel", e=>{ e.preventDefault(); dist=Math.max(1.3,Math.min(9,dist*(1+e.deltaY*0.0012))); }, {passive:false});
 document.getElementById("spin").onclick = e=>{ autospin=!autospin; e.target.classList.toggle("on",autospin); e.target.textContent=autospin?"⏸ spin":"▶ spin"; };
 document.getElementById("reassemble").onclick = ()=>{ anim.t=0; tween(1,1500); };
-document.getElementById("cycle").onclick = e=>{
-  if(anim.mode==="cycle"){ anim.mode="idle"; tween(1,600); e.target.classList.remove("on"); }
-  else { anim.mode="cycle"; anim.t0=performance.now(); e.target.classList.add("on"); }
-};
+document.getElementById("cycle").onclick = e=>{ if(anim.mode==="cycle"){ anim.mode="idle"; tween(1,600); e.target.classList.remove("on"); }
+  else { anim.mode="cycle"; anim.t0=performance.now(); e.target.classList.add("on"); } };
 document.getElementById("sizeR").oninput = e=>{ sizeScale=parseFloat(e.target.value); };
 
-// ------------------------------------------------------------- cartridge ----
-function uploadModel(pos, col, size, opa) {
-  const n = size.length;
-  // scatter = exploded cloud each particle flies out from, for assemble anim
-  const scatter = new Float32Array(n*3);
-  for (let i=0;i<n;i++){
-    const x=pos[3*i],y=pos[3*i+1],z=pos[3*i+2];
-    const r=Math.hypot(x,y,z)||1, k=1.7+Math.random()*1.8;
-    scatter[3*i]  = x/r*k*1.0 + (Math.random()-0.5)*1.4;
-    scatter[3*i+1]= y/r*k*1.0 + (Math.random()-0.5)*1.4 + 0.3;
-    scatter[3*i+2]= z/r*k*1.0 + (Math.random()-0.5)*1.4;
-  }
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aHome);    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aScatter); gl.bufferData(gl.ARRAY_BUFFER, scatter, gl.STATIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aColor);   gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aSize);    gl.bufferData(gl.ARRAY_BUFFER, size, gl.STATIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aOpa);     gl.bufferData(gl.ARRAY_BUFFER, opa, gl.STATIC_DRAW);
-  COUNT = n;
-  document.getElementById("countPill").textContent = n.toLocaleString() + " particles";
-}
-
-async function loadCartridge(animate=true) {
+// ============================================================= cartridge ====
+async function loadCartridge(animate=true){
   const b = await (await fetch(`${API}/v1/cartridge?_=${Date.now()}`)).arrayBuffer();
   const dv = new DataView(b);
-  const n = dv.getUint32(0, true);
-  let o = 4;
-  const pos = new Float32Array(b, o, n*3); o += n*3*4;
-  const col = new Float32Array(b, o, n*3); o += n*3*4;
-  const size= new Float32Array(b, o, n);   o += n*4;
-  const opa = new Float32Array(b, o, n);
-  uploadModel(pos, col, size, opa);
-  if (animate && anim.mode!=="cycle"){ anim.t=0; tween(1, 1400); }
+  // magic "SPL2" (4 bytes) + uint32 N
+  const n = dv.getUint32(4, true);
+  let o = 8;
+  const pos=new Float32Array(b,o,n*3); o+=n*12;
+  const col=new Float32Array(b,o,n*3); o+=n*12;
+  const scale=new Float32Array(b,o,n*3); o+=n*12;
+  const quat=new Float32Array(b,o,n*4); o+=n*16;
+  const opa=new Float32Array(b,o,n);
+  uploadModel(pos,col,scale,quat,opa);
+  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1500); }
 }
 
-// ----------------------------------------------------------------- chat ----
+// ============================================================= chat =========
 const log=document.getElementById("log");
-function add(cls, html){ const d=document.createElement("div"); d.className="msg "+cls; d.innerHTML=html; log.appendChild(d); log.scrollTop=log.scrollHeight; }
+function add(cls,html){ const d=document.createElement("div"); d.className="msg "+cls; d.innerHTML=html; log.appendChild(d); log.scrollTop=log.scrollHeight; }
 function setState(s){ const p=document.getElementById("statePill"); p.textContent=s;
-  const busy=["GENERATING","MORPHING","VERIFYING","SWAP_READY"].includes(s);
-  p.className="pill "+(busy?"busy":(s==="DISPLAYED"?"live":"")); }
-function setSgf(sgf, edges){ if(!sgf) return;
-  document.getElementById("sgf").textContent =
-    `SGF · ${sgf.num_gaussians} gaussians · sh${sgf.sh_degree}\nraw ${(sgf.raw_bytes/1024).toFixed(1)} KB · edges ${edges??0}`; }
+  const busy=["GENERATING","MORPHING","VERIFYING","SWAP_READY"].includes(s); p.className="pill "+(busy?"busy":(s==="DISPLAYED"?"live":"")); }
+function setSgf(sgf,edges){ if(!sgf) return; document.getElementById("sgf").textContent =
+  `SGF · ${sgf.num_gaussians} gaussians · sh${sgf.sh_degree}\nraw ${(sgf.raw_bytes/1024).toFixed(1)} KB · edges ${edges??0}`; }
 
 fetch(`${API}/v1/models`).then(r=>r.json()).then(d=>{
   const mp=document.getElementById("modelPill"), sel=document.getElementById("model");
-  if(d.ollama_available && d.models.length){ mp.innerHTML=`ollama: <b>${d.models.length} model(s)</b>`;
-    d.models.forEach(m=>{ const o=document.createElement("option"); o.value=m; o.textContent=m; sel.appendChild(o); }); }
+  if(d.ollama_available&&d.models.length){ mp.innerHTML=`ollama: <b>${d.models.length} model(s)</b>`;
+    d.models.forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;sel.appendChild(o);}); }
   else mp.textContent="ollama: offline";
 }).catch(()=>document.getElementById("modelPill").textContent="ollama: offline");
 
@@ -347,25 +410,41 @@ async function sendMsg(text){
   if(!text.trim()) return;
   add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
   const model=document.getElementById("model").value;
-  try {
+  try{
     const r=await fetch(`${API}/v1/chat`,{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({message:text, model:model==="heuristic"?null:model, use_ollama:model!=="heuristic"})});
     const d=await r.json();
     document.getElementById("enginePill").textContent=d.engine;
     add("bot",`<span class="eng">${d.engine}</span><br>${(d.assistant||"(no reply)").replace(/</g,"&lt;")}`);
-    (d.actions||[]).forEach(a=>{ const bits=[`<b>${a.tool}</b>`, a.shape?"shape "+a.shape:"", a.name||"",
-      a.ok?"ok":"FAILED", a.verified?"verified":""].filter(Boolean).join(" · "); add("act",bits); });
-    setState(d.state); setSgf(d.sgf, d.edges);
-    await loadCartridge(true);
-  } catch(e){ add("bot",`<span class="eng">error</span><br>API unreachable: ${e}`); setState("ERROR"); }
-  finally { send.disabled=false; input.focus(); }
+    (d.actions||[]).forEach(a=>{ const bits=[`<b>${a.tool}</b>`,a.shape?"shape "+a.shape:"",a.name||"",a.ok?"ok":"FAILED",a.verified?"verified":""].filter(Boolean).join(" · "); add("act",bits); });
+    setState(d.state); setSgf(d.sgf,d.edges); await loadCartridge(true);
+  }catch(e){ add("bot",`<span class="eng">error</span><br>API unreachable: ${e}`); setState("ERROR"); }
+  finally{ send.disabled=false; input.focus(); }
 }
 document.getElementById("chat").addEventListener("submit", e=>{ e.preventDefault(); sendMsg(input.value); });
 document.querySelectorAll(".quick .ctl").forEach(b=>b.onclick=()=>sendMsg(b.dataset.q));
 
-// initial load
-fetch(`${API}/v1/state`).then(r=>r.json()).then(d=>{ setState(d.state); setSgf(d.sgf, d.edges); }).catch(()=>{});
-loadCartridge(true).catch(()=>document.getElementById("hint").textContent="Start the API: ./scripts/run_api.sh");
+// ============================================================= image -> 3D ==
+const fileInput=document.getElementById("file");
+document.getElementById("pick").onclick=()=>fileInput.click();
+fileInput.onchange=()=>{ if(fileInput.files[0]) uploadImage(fileInput.files[0]); };
+["dragover","drop"].forEach(ev=>document.getElementById("drop").addEventListener(ev,e=>{e.preventDefault();
+  if(ev==="drop"&&e.dataTransfer.files[0]) uploadImage(e.dataTransfer.files[0]); }));
+async function uploadImage(file){
+  add("me", `🖼️ ${file.name} → image-to-3D (LGM)`); setState("…");
+  const fd=new FormData(); fd.append("image", file);
+  try{
+    const r=await fetch(`${API}/v1/generate_from_image`, {method:"POST", body:fd});
+    const d=await r.json();
+    document.getElementById("enginePill").textContent=d.engine||"LGM";
+    add("bot",`<span class="eng">${d.engine||"lgm"}</span><br>${d.note||d.status||""}`);
+    setState(d.state||"DISPLAYED"); setSgf(d.sgf,0); await loadCartridge(true);
+  }catch(e){ add("bot",`<span class="eng">error</span><br>${e}`); setState("ERROR"); }
+}
+
+// initial
+fetch(`${API}/v1/state`).then(r=>r.json()).then(d=>{ setState(d.state); setSgf(d.sgf,d.edges); }).catch(()=>{});
+loadCartridge(true).catch(()=>document.getElementById("hint").textContent="Start the API: python -m uvicorn apps.plugin_api:app --port 8000");
 </script>
 </body>
 </html>

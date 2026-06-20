@@ -25,14 +25,21 @@ mock is dressed up as real.
   → front-to-back alpha compositing with transmittance, plus supersampled AA.
   It is the *same algorithm* `gsplat` runs on the GPU — the only trade-off vs
   `GsplatRasterizer` is **speed, not technique** (~50–85 ms/frame at 480px).
-- **The generation/compression adapters are still mocks**, clearly labeled:
-  - `MockGenerator` — a *procedural* shaded shape (sphere/cube/torus/spiral,
-    Lambert-lit, prompt-tinted). It is **not** real image-to-3D reconstruction;
-    it is a placeholder that gives the state machine a plausibly-3D field to
-    converge onto. Real path is `LGMGenerator` (Zero123++ → LGM, lazy/heavy,
-    ≤4GB sequential offload) — left as a `NotImplementedError`-marked slot.
-  - `MockCodec` — identity compression with an **honest size estimate** (not a
-    real encode). Real path: Self-Organizing Gaussians + LightGaussian.
+- **`LGMGenerator` is real image→3D wiring** (`generation/lgm.py`), not a stub:
+  single image → multi-view diffusion (ImageDream) → LGM U-Net → 14-channel
+  3DGS → `GaussianField`, with **sequential VRAM offload** (the two big models
+  never co-reside) and **INT8/INT4 quantization** (`generation/quant.py`,
+  bitsandbytes) to hold ≤4GB. **Caveat (honest):** it needs a CUDA GPU, the
+  `gen` extra, and a one-time weight download — none of which exist in the
+  CPU/numpy PoC, so this path is **not exercised by `pytest` and has not been
+  run here**. It is enabled with `SPLATRA_LGM=1`; otherwise the API falls back to
+  the procedural mock with an explicit note (it never silently pretends). Model
+  IDs / activation conventions must be re-verified at wiring time.
+- **`MockGenerator` is the CPU default** — a *procedural* oriented-surfel shape
+  (sphere/cube/torus/spiral, Lambert-lit, color-word tinted). Explicitly **not**
+  image-to-3D reconstruction; it gives the state machine a plausibly-3D field.
+- **`MockCodec`** — identity compression with an **honest size estimate** (not a
+  real encode). Real path: Self-Organizing Gaussians + LightGaussian.
 - **The local LLM really drives the engine.** `OllamaClient` calls a local
   Ollama server; if the model lacks native tool support it falls back to
   *prompted JSON mode* (`format:"json"`), and if Ollama is down it falls back to
@@ -75,17 +82,23 @@ renders it locally. Type what you want and a local LLM turns it into tool-calls:
 
 - “show a knowledge graph with 30 nodes” → graph hologram (node halos + edge strands)
 - “generate a blue torus”, “make a red cube”, “a gold spiral” → dense 3D object
+- **drop an image** (the "image→3D (LGM)" picker) → feed-forward reconstruction
 
-Particles **assemble** (fly in and reassemble) whenever a new model loads; use
-**⟳ reassemble** to replay it and **∞ auto-cycle** to loop disassemble↔reassemble.
-A **size** slider and **▶ spin** are in the top-right.
+The viewer is a **real anisotropic 3D Gaussian Splatting rasterizer**: each
+splat's 3D covariance (from its scale + quaternion) is projected to a 2D conic
+in the vertex shader (EWA), eigen-decomposed to an oriented screen-space
+ellipse, and composited **back-to-front** using a per-frame 16-bit counting
+**depth sort** — so there are no blending-order artifacts. Objects are emitted
+as oriented surfels (disks tangent to the surface). Particles **assemble** (fly
+in + reassemble) on load; **⟳ reassemble** replays it, **∞ auto-cycle** loops
+disassemble↔reassemble, **size**/**▶ spin** are in the top-right.
 
-> Honesty note: the WebGL viewer draws each Gaussian as a depth-tested,
-> camera-facing **round point-sprite** with a soft falloff — a fast real-time
-> *approximation*, not the full anisotropic EWA splat (per-splat 2D covariance)
-> that `CPURasterizer`/`GsplatRasterizer` compute. The assemble/disassemble
-> motion is a client-side interpolation (scatter↔home), in the spirit of the
-> SGF morph, computed in the vertex shader.
+> Honesty note: this is genuine anisotropic EWA splatting (the antimatter15/
+> gsplat math), the same technique the CPU `CPURasterizer` and the GPU
+> `GsplatRasterizer` compute — running in WebGL2 on your GPU. The depth sort is
+> exact (back-to-front, every frame the camera moves). The assemble/disassemble
+> motion is a client-side scatter↔home interpolation in the vertex shader, in
+> the spirit of the SGF morph.
 
 Pick an **Ollama** model from the dropdown to drive it with your local LLM
 (works even with models that lack native tool-calling, via prompted JSON mode).
@@ -153,9 +166,12 @@ hot-swap signal. The local viewer pulls the cartridge on a side channel.
 - `GET /v1/models` — installed Ollama models (`[]` if Ollama is offline).
 - `POST /v1/chat` — local-LLM tool-calling loop; runs the chosen tool, returns
   the assistant text, action records, engine state, and SGF summary.
-- `GET /v1/cartridge` — the raw Gaussian buffer (binary: positions, colors,
-  sizes, opacities) for the WebGL viewer. Graphs are densified (node halos +
-  edge strands) for the viewer only. **This is the side channel; never the LLM.**
+- `GET /v1/cartridge` — the raw Gaussian buffer (binary `SPL2`: positions,
+  colors, **scale[3] + quaternion[4]** for full anisotropy, opacities) for the
+  WebGL viewer. Graphs are densified (node halos + edge strands) for the viewer
+  only. **This is the side channel; never the LLM.**
+- `POST /v1/generate_from_image` — upload an image → `LGMGenerator` (if
+  `SPLATRA_LGM=1` + GPU) or the honest procedural fallback; hot-swaps the field.
 - `GET /v1/frame?yaw&pitch&dist&w&h` — a server-side EWA-rendered PNG (CPU
   fallback / the OpenAI-plugin contract; the studio uses WebGL instead).
 - `POST /v1/render_knowledge_hologram` — graph → SGF summary + cartridge handle.
@@ -166,11 +182,11 @@ hot-swap signal. The local viewer pulls the cartridge on a side channel.
 ## 6. Layout
 
 ```
-src/atanor_core/   domain (SGF) · ports · mapping · deformation · generation
-                   · compression · verification · state (rasterizer, machine)
-                   · llm (heuristic, ollama)
-apps/plugin_api.py FastAPI + OpenAI tools schema + local-LLM chat loop
-viewer/studio.html Hologram Studio: WebGL2 3D viewer + local-LLM chat, at /
+src/atanor_core/   domain (SGF) · ports · mapping · deformation
+                   · generation (MockGenerator, LGMGenerator, quant) · compression
+                   · verification · state (rasterizer, machine) · llm (heuristic, ollama)
+apps/plugin_api.py FastAPI + tools schema + chat loop + image→3D + cartridge
+viewer/studio.html Hologram Studio: anisotropic WebGL2 3DGS viewer + chat, at /
 viewer/index.html  minimal standalone 2D-splat demo page
 scripts/           demo_render.py (headless) · run_api.sh
 rust/turbovec_rs/  Rust vector-indexer stub (pyo3+maturin planned)
