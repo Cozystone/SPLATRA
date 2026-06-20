@@ -47,7 +47,7 @@ except Exception as exc:  # pragma: no cover - api extra not installed
 from atanor_core import build_default_engine
 from atanor_core.deformation.fourier import FourierDeformer
 from atanor_core.domain.sgf import GaussianField, sh_dc_to_rgb
-from atanor_core.llm.heuristic import HeuristicLLM, detect_shape, sample_graph
+from atanor_core.llm.heuristic import _SHAPE_WORDS, HeuristicLLM, detect_shape, sample_graph
 from atanor_core.llm.ollama import OllamaClient, list_models
 from atanor_core.state.machine import HoloState
 from atanor_core.state.rasterizer import default_intrinsics, orbit_camera
@@ -55,6 +55,18 @@ from atanor_core.state.rasterizer import default_intrinsics, orbit_camera
 # Real LGM image->3D is opt-in (needs CUDA + the `gen` extra + weights).
 _USE_LGM = os.environ.get("SPLATRA_LGM", "0") == "1"
 _lgm_gen = None  # lazy singleton
+# Tiny-SD text->image->3D is opt-in (needs diffusers + a ~1.7GB download).
+_USE_SD = os.environ.get("SPLATRA_SD", "0") == "1"
+_sd_gen = None  # lazy singleton
+
+
+def _sd():
+    global _sd_gen
+    if _sd_gen is None:
+        from atanor_core.generation.text_to_3d import TextTo3DGenerator
+
+        _sd_gen = TextTo3DGenerator()
+    return _sd_gen
 
 app = FastAPI(title="atanor-hologram-core", version="0.1.0")
 
@@ -292,18 +304,40 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
     if name == "generate_3d_object":
         prompt = str(args.get("prompt", "object"))
-        shape = args.get("shape") or detect_shape(prompt)
         obj = _slug(prompt)
-        _engine.generate_3d_object(obj, _prompt_to_mv(prompt), cam_rays={"shape": shape})
-        done = _drive_generation(obj)
-        rec: Dict[str, Any] = {"tool": name, "ok": done, "name": obj, "shape": shape}
-        if done and _engine.field is not None:
-            rec["sgf"] = _sgf_summary(_engine.field)
-            rec["verified"] = bool(_engine.cache[obj].verified)
-            rec["hot_swap"] = True
-        return rec
+        explicit_shape = args.get("shape") or (
+            next((s for w, s in _SHAPE_WORDS.items() if w in prompt.lower()), None)
+        )
+
+        # Unknown object (no sphere/cube/torus/spiral word) + SD enabled -> generate
+        # the ACTUAL object via tiny-SD text->image->3D instead of a generic shape.
+        if _USE_SD and explicit_shape is None:
+            try:
+                field = _sd().generate(prompt)
+                _display_field(obj, field)
+                return {"tool": name, "ok": True, "name": obj, "shape": "tiny-sd→3d",
+                        "sgf": _sgf_summary(field), "verified": True, "hot_swap": True}
+            except Exception as exc:
+                # fall through to procedural with a note in the shape field
+                return {"tool": name, "ok": True, "name": obj,
+                        "shape": f"sphere (SD failed: {type(exc).__name__})",
+                        **_gen_procedural(obj, prompt, "sphere")}
+
+        shape = explicit_shape or "sphere"
+        return {"tool": name, "name": obj, "shape": shape, **_gen_procedural(obj, prompt, shape)}
 
     return {"tool": name, "ok": False, "error": "unknown tool"}
+
+
+def _gen_procedural(obj: str, prompt: str, shape: str) -> Dict[str, Any]:
+    _engine.generate_3d_object(obj, _prompt_to_mv(prompt), cam_rays={"shape": shape})
+    done = _drive_generation(obj)
+    rec: Dict[str, Any] = {"ok": done}
+    if done and _engine.field is not None:
+        rec["sgf"] = _sgf_summary(_engine.field)
+        rec["verified"] = bool(_engine.cache[obj].verified)
+        rec["hot_swap"] = True
+    return rec
 
 
 # --------------------------------------------------------------------------- #
@@ -482,13 +516,17 @@ def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, Gau
     # 2) Real CPU 2.5D RGBD lift — runs anywhere, no weights.
     if img is not None:
         try:
+            from atanor_core.generation.bg import cutout
             from atanor_core.generation.image_lift import Image25DGenerator
 
-            field = Image25DGenerator().from_image(img)
-            note = (lgm_note + "Real 2.5D RGBD lift (CPU): foreground key → relief "
-                    "depth → normals → oriented-surfel 3DGS + back-shell. Honest: a "
-                    "lift of the visible relief, not novel-view synthesis (that is the "
-                    "GPU LGM path, SPLATRA_LGM=1).")
+            cut = cutout(img)                      # rembg U²-Net cutout if present
+            used_cut = cut is not None
+            field = Image25DGenerator().from_image(cut if used_cut else img)
+            note = (lgm_note
+                    + ("Background removed (rembg U²-Net) → " if used_cut else "")
+                    + "real CPU image→3D: silhouette inflation → closed oriented-surfel "
+                    "3DGS volume. Honest: a single-view lift (visible relief inflated), "
+                    "not novel-view synthesis (that is the GPU LGM path, SPLATRA_LGM=1).")
             return ("rgbd-lift(2.5D)", note, field)
         except Exception as exc:
             lgm_note += f"2.5D lift failed ({type(exc).__name__}: {str(exc)[:100]}). "

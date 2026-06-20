@@ -19,6 +19,8 @@ gen = [
     "bitsandbytes>=0.43", "pillow>=10",
 ]
 viz = ["umap-learn>=0.5"]
+# Text->image->3D on CPU (tiny Stable Diffusion + rembg background removal).
+sd = ["torch>=2.1", "diffusers>=0.27", "accelerate>=0.28", "rembg>=2.0", "onnxruntime>=1.17", "pillow>=10"]
 dev = ["pytest>=8", "pytest-timeout>=2"]
 
 [tool.setuptools.packages.find]

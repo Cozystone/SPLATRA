@@ -113,6 +113,28 @@ Pick an **Ollama** model from the dropdown to drive it with your local LLM
 With no Ollama running it transparently uses the offline heuristic router, so
 the UI always works. Color words (“blue”, “red”, … incl. Korean) are honored.
 
+### Text→3D and Image→3D of *real* objects (CPU, opt-in)
+
+Procedural shapes (sphere/cube/torus/spiral) are instant and offline. For an
+**arbitrary object** ("an apple", "a teapot", "피카츄"), enable the real
+generative path — it runs on CPU, no GPU:
+
+```bash
+pip install -e ".[sd]"     # tiny Stable Diffusion (segmind/tiny-sd) + rembg
+SPLATRA_SD=1 ./scripts/run_api.sh
+```
+
+Then a prompt with no shape word → **tiny-SD generates the object image (~4s on
+CPU) → rembg removes the background (U²-Net) → the silhouette is inflated into a
+closed 3D Gaussian volume**. Dropping an image runs the same cutout+inflation.
+
+- Korean nouns are mapped to English (tiny-SD's CLIP is English-only); for other
+  languages type English or set `SPLATRA_SD_MODEL` to a multilingual SD.
+- **Honest:** `tiny-sd` is a *distilled, low-quality* model — fast but rough.
+  Set `SPLATRA_SD_MODEL=stabilityai/sd-turbo` (or SD1.5/SDXL on a GPU) for real
+  quality. And it's **single-view** inflation, not multi-view-consistent 3D —
+  that's the GPU `LGMGenerator` (`SPLATRA_LGM=1`).
+
 ### Local LLM (Ollama)
 
 ```bash

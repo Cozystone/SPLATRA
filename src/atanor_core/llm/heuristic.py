@@ -29,12 +29,17 @@ _GEN_WORDS = [
 ]
 
 
-def detect_shape(text: str) -> str:
+def match_shape(text: str):
+    """Return the procedural shape named in the text, or None if none is named."""
     t = text.lower()
     for word, shape in _SHAPE_WORDS.items():
         if word in t:
             return shape
-    return "sphere"
+    return None
+
+
+def detect_shape(text: str) -> str:
+    return match_shape(text) or "sphere"
 
 
 def sample_graph(n: int = 18, seed: int = 0) -> Dict[str, Any]:
@@ -89,30 +94,25 @@ class HeuristicLLM:
                 ],
             }
 
+        # Only set an explicit shape when one is actually named; otherwise leave
+        # it unset so the backend can synthesize the real object (text->3D).
+        shape = match_shape(t)
+        prompt = user.strip() or (shape or "object")
+        args = {"prompt": prompt}
+        if shape:
+            args["shape"] = shape
         if wants_gen:
-            shape = detect_shape(t)
-            prompt = user.strip() or shape
+            what = f"a 3D '{shape}'" if shape else f"'{prompt}'"
             return {
-                "content": f"Generating a 3D '{shape}' object hologram from your prompt.",
-                "tool_calls": [
-                    {
-                        "name": "generate_3d_object",
-                        "arguments": {"prompt": prompt, "shape": shape, "quality": "fast"},
-                    }
-                ],
+                "content": f"Generating {what} object hologram.",
+                "tool_calls": [{"name": "generate_3d_object", "arguments": args}],
             }
 
         # Default: treat free text as an object prompt.
-        shape = detect_shape(t)
         return {
             "content": (
                 "I'll render that as a 3D object. Try: 'generate a torus', "
                 "'show a knowledge graph with 24 nodes', or 'make a blue cube'."
             ),
-            "tool_calls": [
-                {
-                    "name": "generate_3d_object",
-                    "arguments": {"prompt": user.strip() or "object", "shape": shape},
-                }
-            ],
+            "tool_calls": [{"name": "generate_3d_object", "arguments": args}],
         }
