@@ -113,7 +113,14 @@
       <button class="ctl" data-q="generate a gold spiral">gold spiral</button>
       <button class="ctl" data-q="a green sphere">green sphere</button>
     </div>
-    <div id="drop">image→3D (LGM): <b id="pick">choose / drop an image</b>
+    <div id="rate" style="display:none; padding:0 12px 4px; font-size:11px; color:var(--muted);">
+      <span id="autoScore"></span>
+      rate this 3D: <input id="rateR" type="range" min="0" max="100" value="80" style="width:120px; vertical-align:middle">
+      <b id="rateV" style="color:var(--accent2)">80</b>/100
+      <button class="ctl" id="rateBtn" style="font-size:11px; padding:3px 8px">submit</button>
+      <span id="rateMsg"></span>
+    </div>
+    <div id="drop">image→3D: <b id="pick">choose / drop an image</b>
       <input id="file" type="file" accept="image/*" style="display:none" /></div>
     <form id="chat">
       <select id="model" class="ctl"><option value="heuristic">heuristic (no LLM)</option></select>
@@ -416,13 +423,34 @@ async function sendMsg(text){
     const d=await r.json();
     document.getElementById("enginePill").textContent=d.engine;
     add("bot",`<span class="eng">${d.engine}</span><br>${(d.assistant||"(no reply)").replace(/</g,"&lt;")}`);
-    (d.actions||[]).forEach(a=>{ const bits=[`<b>${a.tool}</b>`,a.shape?"shape "+a.shape:"",a.name||"",a.ok?"ok":"FAILED",a.verified?"verified":""].filter(Boolean).join(" · "); add("act",bits); });
+    (d.actions||[]).forEach(a=>{ const bits=[`<b>${a.tool}</b>`,a.shape?"shape "+a.shape:"",a.name||"",a.ok?"ok":"FAILED",a.verified?"verified":"",
+      a.auto_score!=null?("auto "+a.auto_score+"/100"):""].filter(Boolean).join(" · "); add("act",bits);
+      if(a.name) showRating(a.name, text, a.auto_score); });
     setState(d.state); setSgf(d.sgf,d.edges); await loadCartridge(true);
   }catch(e){ add("bot",`<span class="eng">error</span><br>API unreachable: ${e}`); setState("ERROR"); }
   finally{ send.disabled=false; input.focus(); }
 }
 document.getElementById("chat").addEventListener("submit", e=>{ e.preventDefault(); sendMsg(input.value); });
 document.querySelectorAll(".quick .ctl").forEach(b=>b.onclick=()=>sendMsg(b.dataset.q));
+
+// ============================================================= rating =======
+let lastGen=null;
+const rateBox=document.getElementById("rate"), rateR=document.getElementById("rateR"),
+      rateV=document.getElementById("rateV"), rateMsg=document.getElementById("rateMsg"),
+      autoScoreEl=document.getElementById("autoScore");
+function showRating(name, prompt, auto){
+  lastGen={name, prompt}; rateBox.style.display="block"; rateMsg.textContent="";
+  autoScoreEl.innerHTML = (auto!=null) ? `auto-score <b style="color:var(--accent)">${auto}/100</b> · ` : "";
+}
+rateR.oninput=()=>rateV.textContent=rateR.value;
+document.getElementById("rateBtn").onclick=async()=>{
+  if(!lastGen) return;
+  try{
+    const r=await fetch(`${API}/v1/score`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:lastGen.name, prompt:lastGen.prompt, score:parseInt(rateR.value)})});
+    const d=await r.json(); rateMsg.textContent=` ✓ saved (avg ${d.avg}, n=${d.count})`;
+  }catch(e){ rateMsg.textContent=" ✗ "+e; }
+};
 
 // ============================================================= image -> 3D ==
 const fileInput=document.getElementById("file");
@@ -431,14 +459,15 @@ fileInput.onchange=()=>{ if(fileInput.files[0]) uploadImage(fileInput.files[0]);
 ["dragover","drop"].forEach(ev=>document.getElementById("drop").addEventListener(ev,e=>{e.preventDefault();
   if(ev==="drop"&&e.dataTransfer.files[0]) uploadImage(e.dataTransfer.files[0]); }));
 async function uploadImage(file){
-  add("me", `🖼️ ${file.name} → image-to-3D (LGM)`); setState("…");
+  add("me", `🖼️ ${file.name} → image-to-3D`); setState("…");
   const fd=new FormData(); fd.append("image", file);
   try{
     const r=await fetch(`${API}/v1/generate_from_image`, {method:"POST", body:fd});
     const d=await r.json();
-    document.getElementById("enginePill").textContent=d.engine||"LGM";
-    add("bot",`<span class="eng">${d.engine||"lgm"}</span><br>${d.note||d.status||""}`);
+    document.getElementById("enginePill").textContent=d.engine||"image";
+    add("bot",`<span class="eng">${d.engine||"image"}</span><br>${d.note||d.status||""}`);
     setState(d.state||"DISPLAYED"); setSgf(d.sgf,0); await loadCartridge(true);
+    if(d.name) showRating(d.name, file.name, d.auto_score);
   }catch(e){ add("bot",`<span class="eng">error</span><br>${e}`); setState("ERROR"); }
 }
 

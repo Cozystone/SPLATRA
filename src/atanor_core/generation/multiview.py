@@ -175,6 +175,34 @@ def carve_visual_hull(
     return GaussianField(means, scales, quats, opacities, sh, sh_degree=sh_degree)
 
 
+def silhouette_score(field: GaussianField, masks: np.ndarray, azimuths,
+                     elevations, scale: float = 1.2, S: int = 128) -> float:
+    """Auto quality score (0-100) = mean silhouette IoU of the carved hull
+    re-projected into each input view vs that view's silhouette. High = the 3D
+    reconstruction is faithful to every generated view."""
+    from PIL import Image as I
+
+    m = field.means
+    ious = []
+    for k in range(masks.shape[0]):
+        a, e = float(azimuths[k]), float(elevations[k])
+        d = np.array([np.cos(e) * np.sin(a), np.sin(e), np.cos(e) * np.cos(a)], np.float32)
+        right = np.cross([0, 1, 0], d); right /= np.linalg.norm(right) + 1e-8
+        up = np.cross(d, right)
+        ix = m @ right; iy = m @ up
+        u = np.clip(ix / (2 * scale) + 0.5, 0, 1); v = np.clip(0.5 - iy / (2 * scale), 0, 1)
+        proj = np.zeros((S, S), bool)
+        proj[(v * (S - 1)).astype(int), (u * (S - 1)).astype(int)] = True
+        # dilate the sparse projection a touch to a coverage mask
+        for sh in (1, -1):
+            proj |= np.roll(proj, sh, 0) | np.roll(proj, sh, 1)
+        gt = np.asarray(I.fromarray((masks[k] * 255).astype(np.uint8))
+                        .resize((S, S)), np.float32) / 255.0 > 0.5
+        inter = float((proj & gt).sum()); union = float((proj | gt).sum()) + 1e-6
+        ious.append(inter / union)
+    return round(100.0 * float(np.mean(ious)), 1)
+
+
 def _cache_dir() -> Path:
     d = Path.home() / ".cache" / "splatra" / "zero123plus"
     d.mkdir(parents=True, exist_ok=True)
@@ -251,15 +279,23 @@ class MultiViewGenerator:
             cols.append(np.asarray(c, np.float32) / 255.0)
         masks = np.stack(masks)
         cols = np.stack(cols)
-        return carve_visual_hull(
-            masks, cols, np.radians(azs[:len(masks)]).astype(np.float32),
-            np.radians(els[:len(masks)]).astype(np.float32),
-            grid=self.grid, scale=self.scale,
-        )
+        azr = np.radians(azs[:len(masks)]).astype(np.float32)
+        elr = np.radians(els[:len(masks)]).astype(np.float32)
+        field = carve_visual_hull(masks, cols, azr, elr, grid=self.grid, scale=self.scale)
+        # automatic quality score = mean silhouette IoU (re-projected hull vs views)
+        self.last_score = silhouette_score(field, masks, azr, elr, self.scale)
+        return field
 
-    def generate(self, prompt: str) -> GaussianField:
-        """Text -> SD-Turbo conditioning image -> multi-view 3D."""
+    def generate(self, prompt: str, n: int = None) -> GaussianField:
+        """Text -> SD-Turbo cond image -> multi-view 3D. best-of-N by auto score."""
         if self._t2i is None:
             from .text_to_3d import TextTo3DGenerator
             self._t2i = TextTo3DGenerator()
-        return self.from_cond(self._t2i.image(prompt))
+        n = int(os.environ.get("SPLATRA_BESTOF", "1")) if n is None else int(n)
+        best, best_s = None, -1.0
+        for _ in range(max(1, n)):
+            f = self.from_cond(self._t2i.image(prompt))
+            if self.last_score > best_s:
+                best, best_s = f, self.last_score
+        self.last_score = best_s
+        return best

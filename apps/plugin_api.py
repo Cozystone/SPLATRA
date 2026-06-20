@@ -327,13 +327,18 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # SD lift, else a procedural placeholder.
         if explicit_shape is None and (_USE_MV or _USE_SD):
             try:
+                auto = None
                 if _USE_MV:
                     field = _mv().generate(prompt); tag = "multiview→3d"
+                    auto = getattr(_mv(), "last_score", None)
                 else:
                     field = _sd().generate(prompt); tag = "tiny-sd→3d"
                 _display_field(obj, field)
-                return {"tool": name, "ok": True, "name": obj, "shape": tag,
-                        "sgf": _sgf_summary(field), "verified": True, "hot_swap": True}
+                rec = {"tool": name, "ok": True, "name": obj, "shape": tag,
+                       "sgf": _sgf_summary(field), "verified": True, "hot_swap": True}
+                if auto is not None:
+                    rec["auto_score"] = auto      # silhouette-IoU quality 0-100
+                return rec
             except Exception as exc:
                 return {"tool": name, "ok": True, "name": obj,
                         "shape": f"sphere (gen failed: {type(exc).__name__})",
@@ -377,6 +382,41 @@ def get_tools() -> Dict[str, Any]:
 def get_models() -> Dict[str, Any]:
     models = list_models()
     return {"ollama_available": bool(models), "models": models}
+
+
+class ScoreRequest(BaseModel):
+    name: str
+    prompt: Optional[str] = None
+    score: int                       # human 0-100
+    note: Optional[str] = None
+
+
+_FEEDBACK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "out", "feedback.json")
+
+
+@app.post("/v1/score")
+def submit_score(req: ScoreRequest) -> Dict[str, Any]:
+    """Human feedback (0-100) for the last generation. Appended to out/feedback.json.
+
+    These ratings are the human-in-the-loop signal; combined with the automatic
+    silhouette-IoU score they let the engine prefer better generations (best-of-N
+    is driven by the auto score; human scores accumulate for offline tuning)."""
+    import json
+
+    os.makedirs(os.path.dirname(_FEEDBACK_PATH), exist_ok=True)
+    rows = []
+    if os.path.exists(_FEEDBACK_PATH):
+        try:
+            rows = json.load(open(_FEEDBACK_PATH, encoding="utf-8"))
+        except Exception:
+            rows = []
+    rows.append({"name": req.name, "prompt": req.prompt,
+                 "score": int(max(0, min(100, req.score))),
+                 "note": req.note, "ts": time.time()})
+    json.dump(rows, open(_FEEDBACK_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    scores = [r["score"] for r in rows]
+    return {"ok": True, "count": len(rows), "avg": round(sum(scores) / len(scores), 1)}
 
 
 @app.get("/v1/state")
@@ -569,7 +609,7 @@ async def generate_from_image(image: UploadFile = File(...)) -> Dict[str, Any]:
     name = _slug(image.filename or "image") or "image"
     engine_label, note, field = _image_to_field(name, img)
     _display_field(name, field)
-    return {
+    resp = {
         "status": "displayed",
         "engine": engine_label,
         "note": note,
@@ -577,6 +617,9 @@ async def generate_from_image(image: UploadFile = File(...)) -> Dict[str, Any]:
         "state": _engine.state.value,
         "sgf": _sgf_summary(field),
     }
+    if engine_label.startswith("multiview") and _mv_gen is not None:
+        resp["auto_score"] = getattr(_mv_gen, "last_score", None)
+    return resp
 
 
 @app.get("/v1/frame")
