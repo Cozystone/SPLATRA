@@ -43,6 +43,28 @@ def _box_blur(a: np.ndarray, k: int = 2, iters: int = 3) -> np.ndarray:
     return out
 
 
+def _edge_distance(mask: np.ndarray, iters: int = 90) -> np.ndarray:
+    """Approx distance-to-silhouette-edge via iterative erosion (vectorized).
+
+    dist[p] = number of 4-neighbour erosion steps pixel p survives ≈ its
+    distance from the foreground boundary. Used to inflate the silhouette into a
+    rounded closed volume (thick at the core, zero at the rim).
+    """
+    m = (mask > 0.5).astype(np.float32)
+    dist = np.zeros_like(m)
+    for _ in range(iters):
+        e = m.copy()
+        e[1:, :] = np.minimum(e[1:, :], m[:-1, :])
+        e[:-1, :] = np.minimum(e[:-1, :], m[1:, :])
+        e[:, 1:] = np.minimum(e[:, 1:], m[:, :-1])
+        e[:, :-1] = np.minimum(e[:, :-1], m[:, 1:])
+        m = e
+        dist += m
+        if m.sum() == 0:
+            break
+    return dist
+
+
 def _quat_from_normal(n: np.ndarray) -> np.ndarray:
     n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
     N = n.shape[0]
@@ -68,9 +90,9 @@ def _logit(p, eps=1e-4):
 class Image25DGenerator:
     """Real CPU image -> oriented-surfel GaussianField (2.5D RGBD lift)."""
 
-    def __init__(self, res: int = 168, depth_scale: float = 0.55, sh_degree: int = 1) -> None:
+    def __init__(self, res: int = 168, inflate: float = 0.9, sh_degree: int = 1) -> None:
         self.res = int(res)
-        self.depth_scale = float(depth_scale)
+        self.inflate = float(inflate)   # how round the silhouette puffs out
         self.sh_degree = int(sh_degree)
 
     def from_image(self, image_rgb: np.ndarray) -> GaussianField:
@@ -96,28 +118,28 @@ class Image25DGenerator:
         if cov < 0.02 or cov > 0.97:     # keying failed or fills frame -> billboard
             mask = np.ones((H, W), np.float32)
 
-        # (2) relief depth = blurred-mask bulge + a center radial DOME (so ANY
-        #     image gets volume, not a flat slab) + slight luminance shaping.
+        # (2) INFLATION: distance-to-edge -> spherical half-thickness, so the
+        #     silhouette puffs into a CLOSED rounded volume (thick core, zero
+        #     rim). Front surface = +half (+ a little luminance relief detail),
+        #     back surface = -half; together they wrap into a solid blob.
         lum = rgb.mean(axis=2)
-        bulge = _box_blur(mask, k=max(2, W // 40), iters=3)
-        bulge = bulge / (bulge.max() + 1e-6)
-        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-        msum = float(mask.sum())
-        cy = float((yy * mask).sum() / (msum + 1e-6)) if msum > 0 else H / 2
-        cx = float((xx * mask).sum() / (msum + 1e-6)) if msum > 0 else W / 2
-        rad = np.sqrt(((yy - cy) / (H * 0.5)) ** 2 + ((xx - cx) / (W * 0.5)) ** 2)
-        dome = np.clip(1.0 - rad * rad, 0.0, 1.0)
-        depth = ((0.5 * bulge + 0.35 * dome + 0.15 * lum) * mask).astype(np.float32)
+        dist = _edge_distance(mask, iters=max(40, H // 3))
+        dist = _box_blur(dist, k=max(2, W // 50), iters=2)            # smooth DT facets
+        t = dist / (dist.max() + 1e-6)
+        half = np.sqrt(np.clip(t, 0.0, 1.0)) * self.inflate            # [H,W]
+        relief = _box_blur(mask * lum, k=max(2, W // 36), iters=2)
+        relief = (relief / (relief.max() + 1e-6)) * 0.12
+        front_z = (half + relief * mask).astype(np.float32)
+        back_z = (-half).astype(np.float32)
 
-        # (3) normals from the depth gradient (real per-pixel orientation).
-        gy, gx = np.gradient(depth * self.depth_scale)
-        normals_img = np.stack([-gx, gy, np.ones_like(depth)], axis=2)
+        # surface normals from the front-z field gradient (world x=+col, y=-row)
+        gy, gx = np.gradient(front_z)
+        normals_img = np.stack([-gx, gy, np.ones_like(front_z)], axis=2)
 
-        # (4) unproject masked pixels to 3D (image plane = xy, relief = +z).
+        # (3) sample masked pixels (subsample for a light cartridge)
         ys, xs = np.where(mask > 0.5)
         if xs.size == 0:
             ys, xs = np.mgrid[0:H, 0:W].reshape(2, -1)
-        # subsample for a light cartridge
         max_pts = self.res * self.res
         if xs.size > max_pts:
             sel = np.random.default_rng(0).choice(xs.size, max_pts, replace=False)
@@ -125,18 +147,16 @@ class Image25DGenerator:
 
         u = (xs / (W - 1) - 0.5) * 2.0
         v = -(ys / (H - 1) - 0.5) * 2.0          # flip y (image down -> world up)
-        d = depth[ys, xs]
         col = rgb[ys, xs]
         nrm = normals_img[ys, xs]
 
-        front = np.stack([u, v, d * self.depth_scale], axis=1).astype(np.float32)
-        # (4b) thin, dim back-shell so the object has volume when orbited.
-        back = np.stack([u, v, -d * self.depth_scale * 0.45], axis=1).astype(np.float32)
-        back_col = col * 0.45
-        back_nrm = nrm * np.array([1, 1, -1], np.float32)
+        # front + back surfaces of the inflated blob (rim closes where half→0)
+        front = np.stack([u, v, front_z[ys, xs]], axis=1).astype(np.float32)
+        back = np.stack([u, v, back_z[ys, xs]], axis=1).astype(np.float32)
+        back_nrm = nrm * np.array([1.0, 1.0, -1.0], np.float32)        # face -z
 
         means = np.concatenate([front, back], axis=0)
-        colors = np.clip(np.concatenate([col, back_col], axis=0), 0.0, 1.0).astype(np.float32)
+        colors = np.clip(np.concatenate([col, col * 0.7], axis=0), 0.0, 1.0).astype(np.float32)
         normals = np.concatenate([nrm, back_nrm], axis=0).astype(np.float32)
         n = means.shape[0]
 
