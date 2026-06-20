@@ -83,6 +83,10 @@ class HologramEngine:
         self._pending_field: Optional[GaussianField] = None
         self._gen_name: Optional[str] = None
         self._gen_error: Optional[str] = None
+        # Knowledge-graph edge overlay (rendered, not part of the morph buffer).
+        self._edges: List[tuple] = []
+        self._edge_samples: int = 7
+        self.show_edges: bool = True
 
     # -- events ------------------------------------------------------------ #
     def _emit(self, state: HoloState, **info: Any) -> None:
@@ -101,6 +105,14 @@ class HologramEngine:
         field = self.mapper.map(graph)
         self.field = field
         self.deformer = FourierDeformer(field.means)
+        # Parse edges into node-index pairs (node order == field order).
+        ids = [str(n.get("id", i)) for i, n in enumerate(graph.get("nodes", []))]
+        idx = {nid: i for i, nid in enumerate(ids)}
+        self._edges = []
+        for e in graph.get("edges", []):
+            si, di = idx.get(str(e.get("src"))), idx.get(str(e.get("dst")))
+            if si is not None and di is not None and si != di:
+                self._edges.append((si, di))
         self._emit(HoloState.DISPLAYED, num_gaussians=field.num_gaussians, source="graph")
         return field
 
@@ -131,6 +143,7 @@ class HologramEngine:
             cart = self.cache[name]
             self.field = self.compressor.decompress(cart)
             self.deformer = FourierDeformer(self.field.means)
+            self._edges = []  # an object, not a graph
             self._emit(
                 HoloState.DISPLAYED,
                 name=name,
@@ -227,6 +240,7 @@ class HologramEngine:
             # 0ms hot-swap: replace the live buffer in one assignment.
             self.field = pending
             self.deformer = FourierDeformer(self.field.means)
+            self._edges = []  # generated object replaces the graph
             with self._gen_lock:
                 self._pending_field = None
             self._gen_thread = None
@@ -241,14 +255,52 @@ class HologramEngine:
         return self.state
 
     # -- render ------------------------------------------------------------ #
+    def _edge_overlay(self, node_field: GaussianField) -> GaussianField:
+        """Append thin, dim Gaussians sampled along edges (render-time only).
+
+        Edges are recomputed from current node positions every frame, so they
+        track morphs without being part of the fixed-N deformation buffer.
+        """
+        if not (self.show_edges and self._edges):
+            return node_field
+        m = node_field.means
+        sh0 = node_field.sh[:, 0, :]
+        s = np.linspace(0.15, 0.85, self._edge_samples, dtype=np.float32)
+        pts, cols = [], []
+        for si, di in self._edges:
+            seg = m[si][None, :] * (1 - s[:, None]) + m[di][None, :] * s[:, None]
+            col = sh0[si][None, :] * (1 - s[:, None]) + sh0[di][None, :] * s[:, None]
+            pts.append(seg)
+            cols.append(col)
+        ep = np.concatenate(pts, 0).astype(np.float32)
+        ec = np.concatenate(cols, 0).astype(np.float32)
+        ne = ep.shape[0]
+        escales = np.log(np.full((ne, 3), 0.012, dtype=np.float32))
+        equats = np.zeros((ne, 4), dtype=np.float32)
+        equats[:, 0] = 1.0
+        eop = np.full((ne,), -0.4, dtype=np.float32)  # sigmoid ~0.4, dim
+        k = node_field.sh.shape[1]
+        esh = np.zeros((ne, k, 3), dtype=np.float32)
+        esh[:, 0, :] = ec * 0.7  # slightly dimmer than nodes
+
+        return GaussianField(
+            means=np.concatenate([m, ep], 0),
+            scales=np.concatenate([node_field.scales, escales], 0),
+            quats=np.concatenate([node_field.quats, equats], 0),
+            opacities=np.concatenate([node_field.opacities, eop], 0),
+            sh=np.concatenate([node_field.sh, esh], 0),
+            sh_degree=node_field.sh_degree,
+        )
+
     def render(
         self, viewmat: np.ndarray, K: np.ndarray, width: int, height: int
     ) -> np.ndarray:
-        """Render the current field (deformed positions if mid-morph)."""
+        """Render the current field (deformed positions if mid-morph, + edges)."""
         if self.field is None:
             raise RuntimeError("nothing to render; call render_knowledge_hologram first")
+        live = self.field
         if self.deformer is not None and not self.deformer.done:
             live = self.field.copy()
             live.means = self.deformer.positions
-            return self.rasterizer.render(live, viewmat, K, width, height)
-        return self.rasterizer.render(self.field, viewmat, K, width, height)
+        live = self._edge_overlay(live)
+        return self.rasterizer.render(live, viewmat, K, width, height)
