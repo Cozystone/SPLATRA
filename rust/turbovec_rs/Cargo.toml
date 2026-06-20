@@ -1,0 +1,15 @@
+[package]
+name = "turbovec_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Vector indexer stub for query-relevance Gaussian culling (ATANOR). pyo3+maturin planned."
+
+[lib]
+name = "turbovec_rs"
+# cdylib for a Python extension module via pyo3/maturin.
+crate-type = ["cdylib", "rlib"]
+
+# Real wiring (PRD §3.3 / §8): add pyo3 + build with maturin to expose a
+# VectorIndexPort-compatible module to Python.
+# [dependencies]
+# pyo3 = { version = "0.21", features = ["extension-module"] }

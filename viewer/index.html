@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ATANOR Hologram Viewer (lightweight PoC)</title>
+<style>
+  body { margin: 0; background: #05060a; color: #cfe; font-family: ui-monospace, monospace; }
+  header { padding: 10px 14px; border-bottom: 1px solid #1b2030; }
+  #wrap { display: flex; gap: 14px; padding: 14px; }
+  canvas { background: #0a0c14; border: 1px solid #1b2030; border-radius: 8px; }
+  #log { flex: 1; white-space: pre-wrap; font-size: 12px; color: #8fb; max-height: 512px; overflow:auto; }
+  .muted { color: #5a6; }
+</style>
+</head>
+<body>
+<header>
+  ATANOR Hologram Viewer — <span class="muted">lightweight 2D splat PoC</span>
+</header>
+<div id="wrap">
+  <canvas id="c" width="512" height="512"></canvas>
+  <div id="log">connecting…</div>
+</div>
+
+<!--
+  HONESTY NOTE (PRD §6 / §7.2):
+  This viewer draws Gaussian *centers* as flat 2D additive blobs. It is a
+  placeholder for development only — NOT a real 3D Gaussian splatting renderer.
+  Replace with a proper wgpu / WebGL 3DGS rasterizer (e.g. web-splat or
+  wgpu-3dgs-viewer) for production. It pulls cartridges on a side channel and
+  the API only ever sends SGF summaries + cartridge handles, never raw buffers.
+-->
+<script>
+const API = location.origin.startsWith("http") ? location.origin : "http://localhost:8000";
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const log = (m) => { const el = document.getElementById("log"); el.textContent += "\n" + m; el.scrollTop = el.scrollHeight; };
+
+// Demo graph posted on load so the viewer has something to show.
+const demoGraph = {
+  nodes: Array.from({length: 24}, (_, i) => ({
+    id: "n" + i,
+    embedding: Array.from({length: 8}, () => Math.random() * 2 - 1),
+    centrality: Math.random() * 10,
+    importance: 0.3 + Math.random() * 0.6,
+    category: i % 12,
+  })),
+  edges: [],
+};
+
+function drawSummary(sgf) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.globalCompositeOperation = "lighter";
+  const n = sgf.num_gaussians || 0;
+  // We only have a summary (bbox + count) here; scatter a representative cloud.
+  for (let i = 0; i < n; i++) {
+    const x = Math.random() * canvas.width;
+    const y = Math.random() * canvas.height;
+    const r = 3 + Math.random() * 5;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, "rgba(120,230,200,0.8)");
+    g.addColorStop(1, "rgba(120,230,200,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+async function main() {
+  try {
+    const res = await fetch(API + "/v1/render_knowledge_hologram", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(demoGraph),
+    });
+    const data = await res.json();
+    log("rendered graph: " + JSON.stringify(data.sgf));
+    log("cartridge: " + data.cartridge_id + "  (raw buffer NOT sent — handle only)");
+    drawSummary(data.sgf);
+  } catch (e) {
+    log("API not reachable (" + e + "). Start it: ./scripts/run_api.sh");
+  }
+}
+main();
+</script>
+</body>
+</html>
