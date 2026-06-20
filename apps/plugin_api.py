@@ -61,6 +61,18 @@ _sd_gen = None  # lazy singleton
 # Real multi-view 3D (Zero123++ + visual hull) — opt-in, GPU.
 _USE_MV = os.environ.get("SPLATRA_MV", "0") == "1"
 _mv_gen = None  # lazy singleton
+# Learned single-image 3D (TripoSR) — opt-in, GPU. Highest quality.
+_USE_TRIPOSR = os.environ.get("SPLATRA_TRIPOSR", "0") == "1"
+_triposr_gen = None  # lazy singleton
+
+
+def _triposr():
+    global _triposr_gen
+    if _triposr_gen is None:
+        from atanor_core.generation.triposr import TripoSRGenerator
+
+        _triposr_gen = TripoSRGenerator()
+    return _triposr_gen
 
 
 def _sd():
@@ -325,10 +337,12 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Unknown object (no sphere/cube/torus/spiral word) -> generate the ACTUAL
         # object: real multi-view 3D (Zero123++ + hull) if enabled, else single-view
         # SD lift, else a procedural placeholder.
-        if explicit_shape is None and (_USE_MV or _USE_SD):
+        if explicit_shape is None and (_USE_TRIPOSR or _USE_MV or _USE_SD):
             try:
                 auto = None
-                if _USE_MV:
+                if _USE_TRIPOSR:
+                    field = _triposr().generate(prompt); tag = "triposr→3d"
+                elif _USE_MV:
                     field = _mv().generate(prompt); tag = "multiview→3d"
                     auto = getattr(_mv(), "last_score", None)
                 else:
@@ -553,7 +567,16 @@ def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, Gau
     """Return (engine_label, note, field). Real LGM if enabled+available, else
     an honest procedural placeholder tinted by the image's dominant color."""
     global _lgm_gen
-    # 0) Real multi-view 3D (Zero123++ + visual hull) — GPU, opt-in. Best quality.
+    # 0a) Learned single-image 3D (TripoSR) — GPU, opt-in. Highest quality.
+    if _USE_TRIPOSR and img is not None:
+        try:
+            field = _triposr().from_image(img)
+            return ("triposr→3d", "Learned 3D reconstruction (TripoSR): one image → "
+                    "triplane density+color field → 3D point cloud (fills unseen "
+                    "geometry with a trained prior). RTX-class GPU.", field)
+        except Exception as exc:
+            lgm_note = f"TripoSR failed ({type(exc).__name__}); fell back. "
+    # 0b) Real multi-view 3D (Zero123++ + visual hull) — GPU, opt-in.
     if _USE_MV and img is not None:
         try:
             field = _mv().from_cond(img)

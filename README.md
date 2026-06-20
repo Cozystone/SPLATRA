@@ -136,6 +136,25 @@ closed 3D Gaussian volume**. Dropping an image runs the same cutout+inflation.
   quality. And it's **single-view** inflation, not multi-view-consistent 3D —
   that's the GPU `LGMGenerator` (`SPLATRA_LGM=1`).
 
+### Learned full-3D on a GPU (TripoSR — best quality)
+
+For the highest quality, a *learned* reconstructor fills the geometry the visual
+hull can't (hidden sides), from a single image:
+
+```bash
+git clone https://github.com/VAST-AI-Research/TripoSR ~/.cache/splatra/TripoSR
+pip install -e ".[sd]" omegaconf trimesh
+SPLATRA_TRIPOSR=1 SPLATRA_TRIPOSR_DIR=~/.cache/splatra/TripoSR \
+  SPLATRA_SD=1 ./scripts/run_api.sh
+```
+
+Then any prompt / dropped image runs **SD-Turbo (or your image) → TripoSR
+triplane transformer → query its learned density+color field → 3D point cloud**
+(~20s, ~170k points on an RTX 5080). We sample the field directly, so TripoSR's
+compiled `torchmcubes` dependency is **not** needed (we want points, not a mesh).
+Honest: single-view, so the unseen back is a learned guess — but quality is far
+above the silhouette hull (`generation/triposr.py`).
+
 ### Real multi-view 3D on a GPU (the asymmetric path)
 
 Single-view lift is symmetric. For a **genuine 3D model** (different front / back /
