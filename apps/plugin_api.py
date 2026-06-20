@@ -423,17 +423,19 @@ def cartridge() -> Response:
 # Image -> 3D (real LGM path, with an honest procedural fallback).
 # --------------------------------------------------------------------------- #
 def _decode_image(raw: bytes) -> Optional[np.ndarray]:
+    """Decode to [256,256,4] RGBA in [0,1] — alpha is kept (it's the best
+    foreground mask for transparent character sprites)."""
     try:
         from PIL import Image
 
-        im = Image.open(io.BytesIO(raw)).convert("RGB").resize((256, 256))
+        im = Image.open(io.BytesIO(raw)).convert("RGBA").resize((256, 256))
         return np.asarray(im, dtype=np.float32) / 255.0
     except Exception:
         return None
 
 
 def _dominant_color(img: np.ndarray) -> Tuple[float, float, float]:
-    c = img.reshape(-1, 3).mean(axis=0)
+    c = img[..., :3].reshape(-1, 3).mean(axis=0)
     m = float(c.max())
     c = (c / m * 0.9) if m > 1e-3 else np.array([0.5, 0.6, 0.9], dtype=np.float32)
     return tuple(np.clip(c, 0.14, 1.0).tolist())

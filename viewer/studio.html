@@ -365,7 +365,7 @@ addEventListener("mousemove", e=>{
   const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
   if(drag.pan){ const r=norm(cross([0,1,0],[Math.sin(yaw),0,Math.cos(yaw)])); const k=dist*0.0016;
     target[0]-=r[0]*dx*k; target[2]-=r[2]*dx*k; target[1]+=dy*k; }
-  else { yaw+=dx*0.01; pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.01)); }
+  else { yaw-=dx*0.01; pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.01)); }  // drag follows the surface
 });
 canvas.addEventListener("wheel", e=>{ e.preventDefault(); dist=Math.max(1.3,Math.min(9,dist*(1+e.deltaY*0.0012))); }, {passive:false});
 document.getElementById("spin").onclick = e=>{ autospin=!autospin; e.target.classList.toggle("on",autospin); e.target.textContent=autospin?"⏸ spin":"▶ spin"; };

@@ -77,25 +77,37 @@ class Image25DGenerator:
         img = np.asarray(image_rgb, dtype=np.float32)
         if img.ndim == 2:
             img = np.repeat(img[..., None], 3, axis=2)
-        img = img[..., :3]
         H, W = img.shape[:2]
+        alpha = img[..., 3] if img.shape[2] == 4 else None
+        rgb = img[..., :3]
 
-        # (1) foreground mask: key out the border/background color.
-        border = np.concatenate([img[0], img[-1], img[:, 0], img[:, -1]], axis=0)
-        bg = np.median(border, axis=0)
-        diff = np.linalg.norm(img - bg[None, None, :], axis=2)
-        thr = max(0.10, float(np.percentile(diff, 55)))
-        mask = (diff > thr).astype(np.float32)
+        # (1) foreground mask — alpha if it carries a real cutout (transparent
+        #     sprites), else key out the border/background color.
+        if alpha is not None and float(alpha.std()) > 0.03 and float(alpha.mean()) < 0.97:
+            mask = (alpha > 0.4).astype(np.float32)
+        else:
+            border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]], axis=0)
+            bg = np.median(border, axis=0)
+            diff = np.linalg.norm(rgb - bg[None, None, :], axis=2)
+            thr = max(0.12, float(np.percentile(diff, 60)))
+            mask = (diff > thr).astype(np.float32)
         mask = (_box_blur(mask, 1, 1) > 0.5).astype(np.float32)
-        if mask.mean() < 0.02:           # nothing keyed -> use whole frame
+        cov = float(mask.mean())
+        if cov < 0.02 or cov > 0.97:     # keying failed or fills frame -> billboard
             mask = np.ones((H, W), np.float32)
 
-        # (2) relief depth: blurred mask bulges toward the camera, modulated by
-        #     luminance (brighter -> slightly nearer), confined to the mask.
-        lum = img.mean(axis=2)
+        # (2) relief depth = blurred-mask bulge + a center radial DOME (so ANY
+        #     image gets volume, not a flat slab) + slight luminance shaping.
+        lum = rgb.mean(axis=2)
         bulge = _box_blur(mask, k=max(2, W // 40), iters=3)
         bulge = bulge / (bulge.max() + 1e-6)
-        depth = (0.75 * bulge + 0.25 * (lum * mask)) * mask     # [H,W], 0..~1
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        msum = float(mask.sum())
+        cy = float((yy * mask).sum() / (msum + 1e-6)) if msum > 0 else H / 2
+        cx = float((xx * mask).sum() / (msum + 1e-6)) if msum > 0 else W / 2
+        rad = np.sqrt(((yy - cy) / (H * 0.5)) ** 2 + ((xx - cx) / (W * 0.5)) ** 2)
+        dome = np.clip(1.0 - rad * rad, 0.0, 1.0)
+        depth = ((0.5 * bulge + 0.35 * dome + 0.15 * lum) * mask).astype(np.float32)
 
         # (3) normals from the depth gradient (real per-pixel orientation).
         gy, gx = np.gradient(depth * self.depth_scale)
@@ -114,7 +126,7 @@ class Image25DGenerator:
         u = (xs / (W - 1) - 0.5) * 2.0
         v = -(ys / (H - 1) - 0.5) * 2.0          # flip y (image down -> world up)
         d = depth[ys, xs]
-        col = img[ys, xs]
+        col = rgb[ys, xs]
         nrm = normals_img[ys, xs]
 
         front = np.stack([u, v, d * self.depth_scale], axis=1).astype(np.float32)
