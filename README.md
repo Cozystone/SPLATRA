@@ -136,6 +136,30 @@ closed 3D Gaussian volume**. Dropping an image runs the same cutout+inflation.
   quality. And it's **single-view** inflation, not multi-view-consistent 3D —
   that's the GPU `LGMGenerator` (`SPLATRA_LGM=1`).
 
+### Real multi-view 3D on a GPU (the asymmetric path)
+
+Single-view lift is symmetric. For a **genuine 3D model** (different front / back /
+sides), enable the multi-view path on a CUDA GPU:
+
+```bash
+# CUDA PyTorch (Blackwell/RTX 50xx -> cu128), then the SD stack
+pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+pip install -e ".[sd]"
+SPLATRA_SD=1 SPLATRA_MV=1 ./scripts/run_api.sh
+```
+
+Then any object prompt (or a dropped image) runs:
+**SD-Turbo (or your image) → Zero123++ 6 *consistent* novel views → rembg cutout →
+GPU visual-hull voxel carving → asymmetric 3D point cloud** (~20–35s on an RTX
+5080, ~180k points). The viewer pulls it as a normal SPL2 cartridge. The
+Zero123++ inference code is fetched from its open GitHub repo into
+`~/.cache/splatra/` (its HF custom-code mirror is gated).
+
+> Honest: visual hull recovers the silhouette intersection from the generated
+> views — real 3D and asymmetric, but it can't carve concavities hidden from all
+> views, and quality depends on Zero123++ + the pose calibration. A learned
+> reconstructor (LGM/InstantMesh) fills hidden geometry; that slot is `LGMGenerator`.
+
 ### Local LLM (Ollama)
 
 ```bash
