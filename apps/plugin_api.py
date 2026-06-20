@@ -58,6 +58,9 @@ _lgm_gen = None  # lazy singleton
 # Tiny-SD text->image->3D is opt-in (needs diffusers + a ~1.7GB download).
 _USE_SD = os.environ.get("SPLATRA_SD", "0") == "1"
 _sd_gen = None  # lazy singleton
+# Real multi-view 3D (Zero123++ + visual hull) — opt-in, GPU.
+_USE_MV = os.environ.get("SPLATRA_MV", "0") == "1"
+_mv_gen = None  # lazy singleton
 
 
 def _sd():
@@ -67,6 +70,15 @@ def _sd():
 
         _sd_gen = TextTo3DGenerator()
     return _sd_gen
+
+
+def _mv():
+    global _mv_gen
+    if _mv_gen is None:
+        from atanor_core.generation.multiview import MultiViewGenerator
+
+        _mv_gen = MultiViewGenerator()
+    return _mv_gen
 
 app = FastAPI(title="atanor-hologram-core", version="0.1.0")
 
@@ -310,18 +322,21 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             next((s for w, s in _SHAPE_WORDS.items() if w in prompt.lower()), None)
         )
 
-        # Unknown object (no sphere/cube/torus/spiral word) + SD enabled -> generate
-        # the ACTUAL object via tiny-SD text->image->3D instead of a generic shape.
-        if _USE_SD and explicit_shape is None:
+        # Unknown object (no sphere/cube/torus/spiral word) -> generate the ACTUAL
+        # object: real multi-view 3D (Zero123++ + hull) if enabled, else single-view
+        # SD lift, else a procedural placeholder.
+        if explicit_shape is None and (_USE_MV or _USE_SD):
             try:
-                field = _sd().generate(prompt)
+                if _USE_MV:
+                    field = _mv().generate(prompt); tag = "multiview→3d"
+                else:
+                    field = _sd().generate(prompt); tag = "tiny-sd→3d"
                 _display_field(obj, field)
-                return {"tool": name, "ok": True, "name": obj, "shape": "tiny-sd→3d",
+                return {"tool": name, "ok": True, "name": obj, "shape": tag,
                         "sgf": _sgf_summary(field), "verified": True, "hot_swap": True}
             except Exception as exc:
-                # fall through to procedural with a note in the shape field
                 return {"tool": name, "ok": True, "name": obj,
-                        "shape": f"sphere (SD failed: {type(exc).__name__})",
+                        "shape": f"sphere (gen failed: {type(exc).__name__})",
                         **_gen_procedural(obj, prompt, "sphere")}
 
         shape = explicit_shape or "sphere"
@@ -498,6 +513,15 @@ def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, Gau
     """Return (engine_label, note, field). Real LGM if enabled+available, else
     an honest procedural placeholder tinted by the image's dominant color."""
     global _lgm_gen
+    # 0) Real multi-view 3D (Zero123++ + visual hull) — GPU, opt-in. Best quality.
+    if _USE_MV and img is not None:
+        try:
+            field = _mv().from_cond(img)
+            return ("multiview→3d", "Real multi-view 3D: Zero123++ generated novel "
+                    "views from your image → visual-hull carve → 3D point cloud "
+                    "(asymmetric, all sides). RTX-class GPU.", field)
+        except Exception as exc:
+            lgm_note = f"Multi-view failed ({type(exc).__name__}); fell back. "
     # 1) Full novel-view LGM — GPU only, opt-in.
     if _USE_LGM and img is not None:
         try:
