@@ -35,7 +35,13 @@ mock is dressed up as real.
   run here**. It is enabled with `SPLATRA_LGM=1`; otherwise the API falls back to
   the procedural mock with an explicit note (it never silently pretends). Model
   IDs / activation conventions must be re-verified at wiring time.
-- **`MockGenerator` is the CPU default** — a *procedural* oriented-surfel shape
+- **`Image25DGenerator` is a real CPU image→3D** (`generation/image_lift.py`):
+  a 2.5D RGBD lift (numpy + Pillow, no weights, ~20ms) — foreground keying,
+  relief-depth estimate, normals from the depth gradient, unprojection to
+  oriented-surfel Gaussians + a dim back-shell for volume. It is the default
+  image→3D path (runs anywhere). **Honest:** it reconstructs the *visible relief*
+  (silhouette-accurate, rounded), not unseen geometry — that's the GPU LGM path.
+- **`MockGenerator` is the CPU default** for text prompts — a *procedural* oriented-surfel shape
   (sphere/cube/torus/spiral, Lambert-lit, color-word tinted). Explicitly **not**
   image-to-3D reconstruction; it gives the state machine a plausibly-3D field.
 - **`MockCodec`** — identity compression with an **honest size estimate** (not a
@@ -82,7 +88,9 @@ renders it locally. Type what you want and a local LLM turns it into tool-calls:
 
 - “show a knowledge graph with 30 nodes” → graph hologram (node halos + edge strands)
 - “generate a blue torus”, “make a red cube”, “a gold spiral” → dense 3D object
-- **drop an image** (the "image→3D (LGM)" picker) → feed-forward reconstruction
+- **drop an image** → real image→3DGS: a CPU **2.5D RGBD lift** runs everywhere
+  (foreground key → relief depth → normals → oriented surfels + back-shell, ~20ms,
+  no weights); the full novel-view GPU **LGM** path is opt-in (`SPLATRA_LGM=1`)
 
 The viewer is a **real anisotropic 3D Gaussian Splatting rasterizer**: each
 splat's 3D covariance (from its scale + quaternion) is projected to a 2D conic

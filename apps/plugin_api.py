@@ -461,6 +461,7 @@ def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, Gau
     """Return (engine_label, note, field). Real LGM if enabled+available, else
     an honest procedural placeholder tinted by the image's dominant color."""
     global _lgm_gen
+    # 1) Full novel-view LGM — GPU only, opt-in.
     if _USE_LGM and img is not None:
         try:
             if _lgm_gen is None:
@@ -471,16 +472,29 @@ def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, Gau
             return ("lgm", "Reconstructed with LGM (image → 4-view diffusion → "
                     "LGM U-Net → 3DGS).", field)
         except Exception as exc:  # NotImplemented (no GPU/weights) or runtime
-            note = (f"LGM unavailable ({type(exc).__name__}: {str(exc)[:140]}). "
-                    "Showing a procedural placeholder. Enable on a CUDA box: "
-                    "pip install -e '.[gen]' and SPLATRA_LGM=1.")
+            lgm_note = (f"LGM unavailable ({type(exc).__name__}); fell back to the "
+                        "CPU 2.5D lift. ")
     else:
-        note = ("LGM image→3D is disabled (set SPLATRA_LGM=1 on a CUDA box with "
-                "the .[gen] extra). Showing a procedural placeholder tinted by "
-                "your image — honest mock, not a reconstruction.")
+        lgm_note = ""
+
+    # 2) Real CPU 2.5D RGBD lift — runs anywhere, no weights.
+    if img is not None:
+        try:
+            from atanor_core.generation.image_lift import Image25DGenerator
+
+            field = Image25DGenerator().from_image(img)
+            note = (lgm_note + "Real 2.5D RGBD lift (CPU): foreground key → relief "
+                    "depth → normals → oriented-surfel 3DGS + back-shell. Honest: a "
+                    "lift of the visible relief, not novel-view synthesis (that is the "
+                    "GPU LGM path, SPLATRA_LGM=1).")
+            return ("rgbd-lift(2.5D)", note, field)
+        except Exception as exc:
+            lgm_note += f"2.5D lift failed ({type(exc).__name__}: {str(exc)[:100]}). "
+
+    # 3) Last resort: procedural placeholder tinted by the image.
     color = _dominant_color(img) if img is not None else (0.6, 0.6, 0.7)
     field = _engine.generator.generate(_color_mv(color), cam_rays={"shape": "sphere"})
-    return ("mock(procedural)", note, field)
+    return ("mock(procedural)", lgm_note + "Procedural placeholder.", field)
 
 
 @app.post("/v1/generate_from_image")
