@@ -28,7 +28,26 @@ import numpy as np
 from ..domain.sgf import GaussianField
 from .image_lift import Image25DGenerator
 
-SD_MODEL = os.environ.get("SPLATRA_SD_MODEL", "segmind/tiny-sd")
+def _pick_device():
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _default_model(device: str) -> str:
+    if os.environ.get("SPLATRA_SD_MODEL"):
+        return os.environ["SPLATRA_SD_MODEL"]
+    # On a GPU, use SD-Turbo (1-4 steps, high quality, fits 16GB easily). On CPU,
+    # fall back to the distilled tiny-sd (low quality but ~4s/image).
+    return "stabilityai/sd-turbo" if device == "cuda" else "segmind/tiny-sd"
+
+
+SD_MODEL = os.environ.get("SPLATRA_SD_MODEL", "")
 
 # tiny-SD uses an English CLIP text encoder — Korean prompts produce washed-out
 # blobs. A small noun map keeps the common Korean demo words working; unmapped
@@ -55,12 +74,15 @@ def _translate(prompt: str) -> str:
 
 
 class TextTo3DGenerator:
-    """Lazy tiny-SD text->image, then cutout + inflation lift to a GaussianField."""
+    """Lazy SD text->image (GPU SD-Turbo / CPU tiny-sd), then cutout + lift."""
 
-    def __init__(self, model: str = SD_MODEL, steps: int = 16, size: int = 256) -> None:
-        self.model = model
-        self.steps = int(steps)
-        self.size = int(size)
+    def __init__(self, model: str = "", steps: int = 0, size: int = 0) -> None:
+        self.device = _pick_device()
+        self.model = model or _default_model(self.device)
+        self._turbo = "turbo" in self.model.lower()
+        # turbo: 1-4 steps, no CFG; regular SD: more steps + CFG.
+        self.steps = steps or (3 if self._turbo else (16 if self.device == "cpu" else 25))
+        self.size = size or (512 if self.device == "cuda" else 256)
         self._pipe = None
         self._lift = Image25DGenerator()
 
@@ -68,13 +90,14 @@ class TextTo3DGenerator:
         if self._pipe is not None:
             return
         import torch
-        from diffusers import StableDiffusionPipeline
+        from diffusers import AutoPipelineForText2Image
 
-        pipe = StableDiffusionPipeline.from_pretrained(
-            self.model, torch_dtype=torch.float32, safety_checker=None
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            self.model, torch_dtype=dtype, safety_checker=None
         )
         pipe.set_progress_bar_config(disable=True)
-        self._pipe = pipe.to("cpu")
+        self._pipe = pipe.to(self.device)
 
     def image(self, prompt: str) -> np.ndarray:
         """prompt -> [H,W,3] float image (isolated subject on plain background)."""
@@ -83,14 +106,13 @@ class TextTo3DGenerator:
         full = (f"a single {prompt}, centered, isolated on a plain solid white "
                 "background, full object in frame, vivid saturated colors, detailed, "
                 "product photo, soft studio lighting")
-        out = self._pipe(
-            full,
-            negative_prompt="multiple, cropped, text, watermark, busy background, shadow",
-            num_inference_steps=self.steps,
-            guidance_scale=7.0,
-            height=self.size,
-            width=self.size,
-        ).images[0]
+        kw = dict(num_inference_steps=self.steps, height=self.size, width=self.size)
+        if self._turbo:
+            kw["guidance_scale"] = 0.0           # turbo models are CFG-free
+        else:
+            kw["guidance_scale"] = 7.0
+            kw["negative_prompt"] = "multiple, cropped, text, watermark, busy background, shadow"
+        out = self._pipe(full, **kw).images[0]
         return np.asarray(out.convert("RGB"), dtype=np.float32) / 255.0
 
     def generate(self, prompt: str) -> GaussianField:
