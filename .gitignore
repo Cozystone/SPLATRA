@@ -21,6 +21,9 @@ out/
 rust/turbovec_rs/target/
 Cargo.lock
 
+# Local agent / preview config
+.claude/
+
 # OS / editor
 .DS_Store
 Thumbs.db

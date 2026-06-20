@@ -89,6 +89,19 @@ class VerifierPort(Protocol):
 
 
 @runtime_checkable
+class LLMPort(Protocol):
+    """Chat with tool-calling. Returns {"content": str, "tool_calls": [...]}.
+
+    Each tool call is ``{"name": str, "arguments": dict}``. Adapters: a local
+    Ollama client, or an offline heuristic intent parser (no LLM required).
+    """
+
+    def chat(
+        self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]
+    ) -> Dict[str, Any]: ...
+
+
+@runtime_checkable
 class VectorIndexPort(Protocol):
     """Vector index for query-relevance Gaussian culling (e.g. turbovec_rs)."""
 
@@ -132,6 +145,7 @@ __all__ = [
     "RasterizerPort",
     "CompressorPort",
     "VerifierPort",
+    "LLMPort",
     "VectorIndexPort",
     "TabularisPort",
     "MiroFishPort",

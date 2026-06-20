@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ATANOR Hologram Studio</title>
+<style>
+  :root {
+    --bg:#06080f; --panel:#0c1018; --line:#1b2433; --ink:#cfe6ff;
+    --muted:#6b8199; --accent:#39e6c6; --accent2:#7aa2ff; --warn:#ffb86b;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background:radial-gradient(1200px 700px at 70% -10%, #0e1828 0%, var(--bg) 60%);
+    color:var(--ink); font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  header {
+    display:flex; align-items:center; gap:14px; padding:10px 16px;
+    border-bottom:1px solid var(--line); background:rgba(10,14,22,.7); backdrop-filter:blur(6px);
+  }
+  header h1 { font-size:14px; margin:0; letter-spacing:.5px; }
+  header h1 b { color:var(--accent); }
+  .tag { font-size:11px; color:var(--muted); }
+  .badge {
+    margin-left:auto; display:flex; gap:8px; align-items:center; font-size:11px;
+  }
+  .pill {
+    padding:3px 9px; border:1px solid var(--line); border-radius:999px; color:var(--muted);
+    background:#0a0e16; white-space:nowrap;
+  }
+  .pill b { color:var(--accent2); font-weight:600; }
+  #statePill.live { color:var(--accent); border-color:#1f4a44; }
+  #statePill.busy { color:var(--warn); border-color:#5a4327; }
+
+  main { flex:1; display:flex; min-height:0; }
+  /* viewport */
+  #stage { flex:1.3; position:relative; display:flex; align-items:center; justify-content:center;
+           border-right:1px solid var(--line); overflow:hidden; }
+  #stage canvas { width:min(86%,640px); aspect-ratio:1/1; border-radius:14px;
+    box-shadow:0 0 0 1px var(--line), 0 30px 80px -30px #000, 0 0 70px -20px #0bd6b366;
+    cursor:grab; background:#000; }
+  #stage canvas:active { cursor:grabbing; }
+  #hint { position:absolute; bottom:14px; left:16px; font-size:11px; color:var(--muted); }
+  #sgf { position:absolute; top:14px; left:16px; font-size:11px; color:var(--muted);
+         background:#0a0e16cc; border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+         white-space:pre; }
+  #spin { position:absolute; top:14px; right:16px; }
+  button, select { font-family:inherit; }
+  .ctl { background:#0a0e16; color:var(--ink); border:1px solid var(--line);
+         border-radius:8px; padding:6px 10px; cursor:pointer; }
+  .ctl:hover { border-color:var(--accent2); }
+
+  /* chat */
+  #side { flex:1; min-width:340px; max-width:440px; display:flex; flex-direction:column; background:var(--panel); }
+  #log { flex:1; overflow:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:92%; padding:9px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
+  .me { align-self:flex-end; background:#15314a; border:1px solid #214a63; }
+  .bot { align-self:flex-start; background:#0e1622; border:1px solid var(--line); }
+  .bot .eng { color:var(--accent); font-size:10px; text-transform:uppercase; letter-spacing:.6px; }
+  .act { align-self:flex-start; font-size:11px; color:var(--muted); border-left:2px solid var(--accent);
+         padding:4px 10px; background:#0a0e16; border-radius:6px; }
+  .act b { color:var(--accent); }
+  .quick { display:flex; flex-wrap:wrap; gap:6px; padding:8px 12px 0; }
+  .quick .ctl { font-size:11px; padding:5px 9px; color:var(--muted); }
+  form { display:flex; gap:8px; padding:12px; border-top:1px solid var(--line); }
+  #model { max-width:150px; }
+  #msg { flex:1; background:#0a0e16; color:var(--ink); border:1px solid var(--line);
+         border-radius:10px; padding:9px 12px; outline:none; }
+  #msg:focus { border-color:var(--accent); }
+  #send { background:linear-gradient(180deg,#1ad6b6,#0fae93); color:#04140f; border:none;
+          font-weight:700; padding:0 16px; border-radius:10px; cursor:pointer; }
+  #send:disabled { opacity:.5; cursor:default; }
+  .note { font-size:10px; color:var(--muted); padding:0 12px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>ATANOR</b> Hologram Studio</h1>
+  <span class="tag">local LLM → 3D Gaussian engine</span>
+  <div class="badge">
+    <span class="pill">engine <b id="enginePill">heuristic</b></span>
+    <span class="pill" id="modelPill">ollama: checking…</span>
+    <span class="pill" id="statePill">IDLE</span>
+  </div>
+</header>
+
+<main>
+  <section id="stage">
+    <div id="sgf">SGF —</div>
+    <button id="spin" class="ctl">▶ auto-spin</button>
+    <canvas id="view" width="480" height="480"></canvas>
+    <div id="hint">drag to orbit · scroll to zoom · the image is the CPU EWA rasterizer's actual output</div>
+  </section>
+
+  <section id="side">
+    <div id="log">
+      <div class="msg bot"><span class="eng">system</span><br>
+        Type what you want to see. Try the quick buttons, or:
+        “a glowing knowledge graph with 24 nodes”, “generate a torus”, “make a blue cube”.
+        Pick an Ollama model above to drive it with your local LLM (falls back to the offline
+        heuristic if Ollama isn’t running).</div>
+    </div>
+    <div class="quick">
+      <button class="ctl" data-q="show a knowledge graph with 24 nodes">graph ×24</button>
+      <button class="ctl" data-q="generate a torus">torus</button>
+      <button class="ctl" data-q="make a cube">cube</button>
+      <button class="ctl" data-q="generate a spiral">spiral</button>
+      <button class="ctl" data-q="generate a sphere">sphere</button>
+    </div>
+    <form id="chat">
+      <select id="model" class="ctl"><option value="heuristic">heuristic (no LLM)</option></select>
+      <input id="msg" placeholder="describe a hologram…" autocomplete="off" />
+      <button id="send" type="submit">Send</button>
+    </form>
+    <div class="note">No raw 3D buffers are sent to the LLM — only SGF summaries + a cartridge
+      handle. The viewport pulls frames on a side channel (/v1/frame).</div>
+  </section>
+</main>
+
+<script>
+const API = location.origin;
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d");
+const RES = 440;
+canvas.width = canvas.height = RES;
+
+// ---- camera state ----
+let yaw = 0.6, pitch = 0.35, dist = 3.2;
+let dirty = true, pending = false, autospin = false, pullUntil = 0;
+
+function pull() {
+  if (pending) return;
+  pending = true;
+  const u = `${API}/v1/frame?yaw=${yaw.toFixed(3)}&pitch=${pitch.toFixed(3)}&dist=${dist.toFixed(2)}&w=${RES}&h=${RES}&_=${Date.now()}`;
+  const im = new Image();
+  im.onload = () => { ctx.drawImage(im, 0, 0, RES, RES); pending = false; };
+  im.onerror = () => { pending = false; };
+  im.src = u;
+}
+// setInterval (not requestAnimationFrame) so a backgrounded tab still updates
+// — rAF is paused/throttled when the tab isn't visible.
+setInterval(() => {
+  const t = performance.now();
+  if (autospin) { yaw += 0.012; dirty = true; }
+  // Pull only when there's a reason to — otherwise the page goes idle (no
+  // constant network/CPU). dirty = orbit/zoom/action; pullUntil = post-action window.
+  if (!pending && (dirty || autospin || t < pullUntil)) { pull(); dirty = false; }
+}, 60);
+
+// ---- orbit / zoom ----
+let drag = null;
+canvas.addEventListener("mousedown", e => drag = { x: e.clientX, y: e.clientY });
+addEventListener("mouseup", () => drag = null);
+addEventListener("mousemove", e => {
+  if (!drag) return;
+  yaw += (e.clientX - drag.x) * 0.01;
+  pitch = Math.max(-1.4, Math.min(1.4, pitch + (e.clientY - drag.y) * 0.01));
+  drag = { x: e.clientX, y: e.clientY }; dirty = true;
+});
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  dist = Math.max(1.7, Math.min(7, dist * (1 + e.deltaY * 0.0012))); dirty = true;
+}, { passive: false });
+document.getElementById("spin").onclick = (e) => {
+  autospin = !autospin; e.target.textContent = autospin ? "⏸ stop" : "▶ auto-spin";
+};
+
+// ---- helpers ----
+const log = document.getElementById("log");
+function add(cls, html) {
+  const d = document.createElement("div"); d.className = "msg " + cls; d.innerHTML = html;
+  log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
+}
+function setState(s) {
+  const p = document.getElementById("statePill"); p.textContent = s;
+  const busy = ["GENERATING", "MORPHING", "VERIFYING", "SWAP_READY"].includes(s);
+  p.className = "pill " + (busy ? "busy" : (s === "DISPLAYED" ? "live" : ""));
+}
+function setSgf(sgf, edges) {
+  if (!sgf) return;
+  document.getElementById("sgf").textContent =
+    `SGF · ${sgf.num_gaussians} gaussians · sh${sgf.sh_degree}\n` +
+    `raw ${(sgf.raw_bytes/1024).toFixed(1)} KB · edges ${edges ?? 0}\n` +
+    `bbox ${JSON.stringify(sgf.bbox_min)}→${JSON.stringify(sgf.bbox_max)}`;
+}
+
+// ---- models ----
+fetch(`${API}/v1/models`).then(r => r.json()).then(d => {
+  const mp = document.getElementById("modelPill");
+  const sel = document.getElementById("model");
+  if (d.ollama_available && d.models.length) {
+    mp.innerHTML = `ollama: <b>${d.models.length} model(s)</b>`;
+    d.models.forEach(m => { const o = document.createElement("option"); o.value = m; o.textContent = m; sel.appendChild(o); });
+  } else {
+    mp.textContent = "ollama: offline";
+  }
+}).catch(() => { document.getElementById("modelPill").textContent = "ollama: offline"; });
+
+// ---- chat ----
+const send = document.getElementById("send");
+const input = document.getElementById("msg");
+async function sendMsg(text) {
+  if (!text.trim()) return;
+  add("me", text.replace(/</g, "&lt;"));
+  input.value = ""; send.disabled = true; setState("…");
+  const model = document.getElementById("model").value;
+  pullUntil = performance.now() + 4000; // keep frames flowing while it works
+  try {
+    const r = await fetch(`${API}/v1/chat`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, model: model === "heuristic" ? null : model, use_ollama: model !== "heuristic" })
+    });
+    const d = await r.json();
+    document.getElementById("enginePill").textContent = d.engine;
+    add("bot", `<span class="eng">${d.engine}</span><br>${(d.assistant || "(no reply)").replace(/</g, "&lt;")}`);
+    (d.actions || []).forEach(a => {
+      const bits = [`<b>${a.tool}</b>`, a.shape ? "shape " + a.shape : "", a.name ? a.name : "",
+                    a.ok ? "ok" : "FAILED", a.verified ? "verified" : ""].filter(Boolean).join(" · ");
+      add("act", bits);
+    });
+    setState(d.state); setSgf(d.sgf, d.edges);
+  } catch (e) {
+    add("bot", `<span class="eng">error</span><br>API unreachable: ${e}`);
+    setState("ERROR");
+  } finally {
+    pullUntil = performance.now() + 1500; dirty = true; send.disabled = false; input.focus();
+  }
+}
+document.getElementById("chat").addEventListener("submit", e => { e.preventDefault(); sendMsg(input.value); });
+document.querySelectorAll(".quick .ctl").forEach(b => b.onclick = () => sendMsg(b.dataset.q));
+
+// initial state
+fetch(`${API}/v1/state`).then(r => r.json()).then(d => { setState(d.state); setSgf(d.sgf, d.edges); }).catch(() => {});
+</script>
+</body>
+</html>
