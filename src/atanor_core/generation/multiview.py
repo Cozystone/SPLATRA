@@ -29,6 +29,23 @@ import numpy as np
 
 from ..domain.sgf import GaussianField, rgb_to_sh_dc
 
+
+def _quat_from_normal_np(n: np.ndarray) -> np.ndarray:
+    """[N,3] normals -> [N,4] quats mapping local +z onto n (oriented surfels)."""
+    n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
+    N = n.shape[0]
+    z = np.array([0.0, 0.0, 1.0], np.float32)
+    dotv = np.clip(n[:, 2], -1.0, 1.0)
+    axis = np.cross(np.broadcast_to(z, (N, 3)), n)
+    an = np.linalg.norm(axis, axis=1, keepdims=True)
+    axis = np.where(an < 1e-6, np.array([1.0, 0.0, 0.0], np.float32), axis / np.maximum(an, 1e-8))
+    half = np.arccos(dotv) * 0.5
+    s = np.sin(half)
+    q = np.empty((N, 4), np.float32)
+    q[:, 0] = np.cos(half); q[:, 1] = axis[:, 0] * s
+    q[:, 2] = axis[:, 1] * s; q[:, 3] = axis[:, 2] * s
+    return q
+
 # Zero123++ diffusers pipeline code (HF custom-code repo is gated; GitHub is open).
 _Z123_PIPELINE_URL = (
     "https://raw.githubusercontent.com/SUDO-AI-3D/zero123plus/main/"
@@ -96,26 +113,62 @@ def carve_visual_hull(
         depth_best = torch.where(sel, depth, depth_best)
         color_best = torch.where(sel.unsqueeze(1), col[v, py, px], color_best)
 
-    idx = torch.nonzero(occ, as_tuple=False).squeeze(1)
-    if idx.numel() < 32:                          # carve failed -> empty
+    if occ.sum() < 32:                            # carve failed -> empty
         raise RuntimeError("visual hull empty (silhouettes did not intersect)")
+
+    import torch.nn.functional as F
+
+    G = grid
+    occg = occ.float().view(1, 1, G, G, G)
+    # smoothed occupancy field -> sub-voxel surface + stable normals
+    occ_soft = occg
+    for _ in range(2):
+        occ_soft = F.avg_pool3d(occ_soft, 3, stride=1, padding=1)
+    # surface shell = occupied voxels that touch empty space (boundary only)
+    empty_near = F.max_pool3d(1.0 - occg, 3, stride=1, padding=1)
+    surface = (occg > 0.5) & (empty_near > 0.5)
+    surf_flat = surface.view(-1)
+    # outward normal = -gradient of the smoothed occupancy
+    s3 = occ_soft.view(G, G, G)
+    gx = torch.zeros_like(s3); gy = torch.zeros_like(s3); gz = torch.zeros_like(s3)
+    gx[1:-1] = s3[2:] - s3[:-2]
+    gy[:, 1:-1] = s3[:, 2:] - s3[:, :-2]
+    gz[:, :, 1:-1] = s3[:, :, 2:] - s3[:, :, :-2]
+    normals_grid = -torch.stack([gx, gy, gz], dim=-1).view(-1, 3)  # outward
+
+    idx = torch.nonzero(surf_flat, as_tuple=False).squeeze(1)
+    if idx.numel() < 64:                          # too thin -> fall back to solid
+        idx = torch.nonzero(occ, as_tuple=False).squeeze(1)
+        solid = True
+    else:
+        solid = False
     if idx.numel() > max_points:
         keep = torch.randperm(idx.numel(), device=dev)[:max_points]
         idx = idx[keep]
+
     pts = P[idx] + torch.randn(idx.numel(), 3, device=dev) * noise
     cols = color_best[idx].clamp(0, 1)
+    nrm = normals_grid[idx]
+    nlen = nrm.norm(dim=1, keepdim=True)
+    nrm = torch.where(nlen > 1e-4, nrm / (nlen + 1e-8),
+                      torch.tensor([0.0, 0.0, 1.0], device=dev))
 
     means = pts.cpu().numpy().astype(np.float32)
     colors_np = cols.cpu().numpy().astype(np.float32)
+    normals_np = nrm.cpu().numpy().astype(np.float32)
     n = means.shape[0]
     c = 0.5 * (means.max(0) + means.min(0))
     s = (means.max(0) - means.min(0)).max() * 0.5 + 1e-6
     means = ((means - c) / s).astype(np.float32)
 
-    px_w = 2.4 / grid
-    scales = np.log(np.tile(np.array([px_w, px_w, px_w], np.float32), (n, 1)))
-    quats = np.zeros((n, 4), np.float32); quats[:, 0] = 1.0
-    opacities = np.full((n,), _logit(0.9), np.float32)
+    vox = 2.0 / G
+    if solid:                                     # isotropic points (no surface)
+        scales = np.log(np.tile(np.array([vox * 1.2] * 3, np.float32), (n, 1)))
+        quats = np.zeros((n, 4), np.float32); quats[:, 0] = 1.0
+    else:                                         # oriented surfels: wide tangent, thin normal
+        scales = np.log(np.tile(np.array([vox * 1.7, vox * 1.7, vox * 0.5], np.float32), (n, 1)))
+        quats = _quat_from_normal_np(normals_np)
+    opacities = np.full((n,), _logit(0.92), np.float32)
     k = (sh_degree + 1) ** 2
     sh = np.zeros((n, k, 3), np.float32)
     sh[:, 0, :] = rgb_to_sh_dc(colors_np)
@@ -136,7 +189,7 @@ class MultiViewGenerator:
     honest "≥3 views fused" pipeline. Opt-in via SPLATRA_MV=1.
     """
 
-    def __init__(self, grid: int = 160, scale: float = 1.2, steps: int = 28) -> None:
+    def __init__(self, grid: int = 200, scale: float = 1.2, steps: int = 28) -> None:
         self.grid = int(grid)
         self.scale = float(scale)
         self.steps = int(steps)
