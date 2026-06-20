@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Project artifacts
+out/
+*.ppm
+
+# Rust
+rust/turbovec_rs/target/
+Cargo.lock
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

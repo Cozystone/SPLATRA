@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atanor-hologram-core"
+version = "0.1.0"
+description = "Standalone 3D Gaussian hologram + generation engine, LLM-plugin ready"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2"]
+gpu = ["torch>=2.1", "gsplat>=1.0"]
+gen = ["torch>=2.1", "diffusers>=0.27", "transformers>=4.38"]
+viz = ["umap-learn>=0.5"]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
