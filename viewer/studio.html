@@ -23,36 +23,32 @@
   header h1 { font-size:14px; margin:0; letter-spacing:.5px; }
   header h1 b { color:var(--accent); }
   .tag { font-size:11px; color:var(--muted); }
-  .badge {
-    margin-left:auto; display:flex; gap:8px; align-items:center; font-size:11px;
-  }
-  .pill {
-    padding:3px 9px; border:1px solid var(--line); border-radius:999px; color:var(--muted);
-    background:#0a0e16; white-space:nowrap;
-  }
+  .badge { margin-left:auto; display:flex; gap:8px; align-items:center; font-size:11px; }
+  .pill { padding:3px 9px; border:1px solid var(--line); border-radius:999px; color:var(--muted);
+          background:#0a0e16; white-space:nowrap; }
   .pill b { color:var(--accent2); font-weight:600; }
   #statePill.live { color:var(--accent); border-color:#1f4a44; }
   #statePill.busy { color:var(--warn); border-color:#5a4327; }
 
   main { flex:1; display:flex; min-height:0; }
-  /* viewport */
-  #stage { flex:1.3; position:relative; display:flex; align-items:center; justify-content:center;
-           border-right:1px solid var(--line); overflow:hidden; }
-  #stage canvas { width:min(86%,640px); aspect-ratio:1/1; border-radius:14px;
-    box-shadow:0 0 0 1px var(--line), 0 30px 80px -30px #000, 0 0 70px -20px #0bd6b366;
-    cursor:grab; background:#000; }
-  #stage canvas:active { cursor:grabbing; }
-  #hint { position:absolute; bottom:14px; left:16px; font-size:11px; color:var(--muted); }
-  #sgf { position:absolute; top:14px; left:16px; font-size:11px; color:var(--muted);
-         background:#0a0e16cc; border:1px solid var(--line); border-radius:8px; padding:8px 10px;
-         white-space:pre; }
-  #spin { position:absolute; top:14px; right:16px; }
-  button, select { font-family:inherit; }
+  #stage { flex:1.3; position:relative; border-right:1px solid var(--line); overflow:hidden; }
+  #gl { width:100%; height:100%; display:block; cursor:grab; }
+  #gl:active { cursor:grabbing; }
+  .overlay { position:absolute; font-size:11px; color:var(--muted); pointer-events:none; }
+  #sgf { top:14px; left:16px; background:#0a0e16cc; border:1px solid var(--line);
+         border-radius:8px; padding:8px 10px; white-space:pre; }
+  #hint { bottom:14px; left:16px; }
+  #tools { position:absolute; top:12px; right:14px; display:flex; flex-wrap:wrap; gap:6px;
+           justify-content:flex-end; max-width:60%; }
   .ctl { background:#0a0e16; color:var(--ink); border:1px solid var(--line);
-         border-radius:8px; padding:6px 10px; cursor:pointer; }
+         border-radius:8px; padding:6px 10px; cursor:pointer; font-family:inherit; }
   .ctl:hover { border-color:var(--accent2); }
+  .ctl.on { border-color:var(--accent); color:var(--accent); }
+  #tools .ctl { font-size:11px; padding:5px 9px; }
+  .slider { display:flex; align-items:center; gap:6px; background:#0a0e16; border:1px solid var(--line);
+            border-radius:8px; padding:3px 8px; color:var(--muted); }
+  .slider input { width:80px; }
 
-  /* chat */
   #side { flex:1; min-width:340px; max-width:440px; display:flex; flex-direction:column; background:var(--panel); }
   #log { flex:1; overflow:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
   .msg { max-width:92%; padding:9px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
@@ -78,161 +74,298 @@
 <body>
 <header>
   <h1><b>ATANOR</b> Hologram Studio</h1>
-  <span class="tag">local LLM → 3D Gaussian engine</span>
+  <span class="tag">local LLM → WebGL Gaussian hologram</span>
   <div class="badge">
     <span class="pill">engine <b id="enginePill">heuristic</b></span>
     <span class="pill" id="modelPill">ollama: checking…</span>
+    <span class="pill" id="countPill">0 particles</span>
     <span class="pill" id="statePill">IDLE</span>
   </div>
 </header>
 
 <main>
   <section id="stage">
-    <div id="sgf">SGF —</div>
-    <button id="spin" class="ctl">▶ auto-spin</button>
-    <canvas id="view" width="480" height="480"></canvas>
-    <div id="hint">drag to orbit · scroll to zoom · the image is the CPU EWA rasterizer's actual output</div>
+    <canvas id="gl"></canvas>
+    <div id="sgf" class="overlay">SGF —</div>
+    <div id="tools">
+      <button class="ctl" id="spin">▶ spin</button>
+      <button class="ctl" id="reassemble">⟳ reassemble</button>
+      <button class="ctl" id="cycle">∞ auto-cycle</button>
+      <label class="slider">size <input id="sizeR" type="range" min="0.4" max="3" step="0.1" value="1.3"></label>
+    </div>
+    <div id="hint" class="overlay">drag = orbit · scroll = zoom · right-drag / shift-drag = pan · real 3D, rendered in your browser</div>
   </section>
 
   <section id="side">
     <div id="log">
       <div class="msg bot"><span class="eng">system</span><br>
-        Type what you want to see. Try the quick buttons, or:
-        “a glowing knowledge graph with 24 nodes”, “generate a torus”, “make a blue cube”.
-        Pick an Ollama model above to drive it with your local LLM (falls back to the offline
-        heuristic if Ollama isn’t running).</div>
+        Type what to build — it becomes a real 3D Gaussian hologram you can orbit.
+        Try the quick buttons, or “a glowing knowledge graph with 30 nodes”,
+        “generate a blue torus”, “make a red spiral”. Pick an Ollama model above
+        to drive it with your local LLM. Use ⟳ / ∞ to watch the particles
+        disassemble and reassemble.</div>
     </div>
     <div class="quick">
-      <button class="ctl" data-q="show a knowledge graph with 24 nodes">graph ×24</button>
-      <button class="ctl" data-q="generate a torus">torus</button>
-      <button class="ctl" data-q="make a cube">cube</button>
-      <button class="ctl" data-q="generate a spiral">spiral</button>
-      <button class="ctl" data-q="generate a sphere">sphere</button>
+      <button class="ctl" data-q="show a knowledge graph with 30 nodes">graph ×30</button>
+      <button class="ctl" data-q="generate a blue torus">blue torus</button>
+      <button class="ctl" data-q="make a red cube">red cube</button>
+      <button class="ctl" data-q="generate a gold spiral">gold spiral</button>
+      <button class="ctl" data-q="a green sphere">green sphere</button>
     </div>
     <form id="chat">
       <select id="model" class="ctl"><option value="heuristic">heuristic (no LLM)</option></select>
       <input id="msg" placeholder="describe a hologram…" autocomplete="off" />
       <button id="send" type="submit">Send</button>
     </form>
-    <div class="note">No raw 3D buffers are sent to the LLM — only SGF summaries + a cartridge
-      handle. The viewport pulls frames on a side channel (/v1/frame).</div>
+    <div class="note">No raw 3D buffers go to the LLM — only SGF summaries + a cartridge
+      handle. The viewer pulls the Gaussian buffer on a side channel (/v1/cartridge)
+      and renders it locally on the GPU.</div>
   </section>
 </main>
 
 <script>
 const API = location.origin;
-const canvas = document.getElementById("view");
-const ctx = canvas.getContext("2d");
-const RES = 440;
-canvas.width = canvas.height = RES;
+// ----------------------------------------------------------------- WebGL ----
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl2", { antialias: true, premultipliedAlpha: true });
+if (!gl) document.getElementById("hint").textContent = "WebGL2 not available in this browser.";
 
-// ---- camera state ----
-let yaw = 0.6, pitch = 0.35, dist = 3.2;
-let dirty = true, pending = false, autospin = false, pullUntil = 0;
+const VERT = `#version 300 es
+in vec3 aHome; in vec3 aScatter; in vec3 aColor; in float aSize; in float aOpa;
+uniform mat4 uProj, uView; uniform float uT, uPx, uSize;
+out vec3 vColor; out float vOpa;
+void main() {
+  float e = uT * uT * (3.0 - 2.0 * uT);            // smoothstep assemble factor
+  vec3 pos = mix(aScatter, aHome, e);
+  float ang = (1.0 - e) * 2.6;                      // swirl that unwinds as it forms
+  float ca = cos(ang), sa = sin(ang);
+  pos.xz = mat2(ca, -sa, sa, ca) * pos.xz;
+  vec4 cam = uView * vec4(pos, 1.0);
+  gl_Position = uProj * cam;
+  float d = max(-cam.z, 0.05);
+  gl_PointSize = clamp(aSize * uPx * uSize / d, 1.0, 56.0);
+  vColor = aColor; vOpa = aOpa;
+}`;
+const FRAG = `#version 300 es
+precision mediump float;
+in vec3 vColor; in float vOpa; out vec4 frag;
+void main() {
+  vec2 d = gl_PointCoord - 0.5;
+  float r2 = dot(d, d) * 4.0;
+  if (r2 > 1.0) discard;
+  float a = exp(-2.8 * r2) * vOpa;                  // soft gaussian splat
+  frag = vec4(vColor * a, a);                       // premultiplied "over"
+}`;
 
-function pull() {
-  if (pending) return;
-  pending = true;
-  const u = `${API}/v1/frame?yaw=${yaw.toFixed(3)}&pitch=${pitch.toFixed(3)}&dist=${dist.toFixed(2)}&w=${RES}&h=${RES}&_=${Date.now()}`;
-  const im = new Image();
-  im.onload = () => { ctx.drawImage(im, 0, 0, RES, RES); pending = false; };
-  im.onerror = () => { pending = false; };
-  im.src = u;
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s;
 }
-// setInterval (not requestAnimationFrame) so a backgrounded tab still updates
-// — rAF is paused/throttled when the tab isn't visible.
-setInterval(() => {
-  const t = performance.now();
-  if (autospin) { yaw += 0.012; dirty = true; }
-  // Pull only when there's a reason to — otherwise the page goes idle (no
-  // constant network/CPU). dirty = orbit/zoom/action; pullUntil = post-action window.
-  if (!pending && (dirty || autospin || t < pullUntil)) { pull(); dirty = false; }
-}, 60);
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog); gl.useProgram(prog);
 
-// ---- orbit / zoom ----
-let drag = null;
-canvas.addEventListener("mousedown", e => drag = { x: e.clientX, y: e.clientY });
-addEventListener("mouseup", () => drag = null);
-addEventListener("mousemove", e => {
-  if (!drag) return;
-  yaw += (e.clientX - drag.x) * 0.01;
-  pitch = Math.max(-1.4, Math.min(1.4, pitch + (e.clientY - drag.y) * 0.01));
-  drag = { x: e.clientX, y: e.clientY }; dirty = true;
-});
-canvas.addEventListener("wheel", e => {
-  e.preventDefault();
-  dist = Math.max(1.7, Math.min(7, dist * (1 + e.deltaY * 0.0012))); dirty = true;
-}, { passive: false });
-document.getElementById("spin").onclick = (e) => {
-  autospin = !autospin; e.target.textContent = autospin ? "⏸ stop" : "▶ auto-spin";
-};
+const loc = {};
+["aHome","aScatter","aColor","aSize","aOpa"].forEach(a => loc[a] = gl.getAttribLocation(prog, a));
+["uProj","uView","uT","uPx","uSize"].forEach(u => loc[u] = gl.getUniformLocation(prog, u));
+const buf = { aHome: gl.createBuffer(), aScatter: gl.createBuffer(),
+              aColor: gl.createBuffer(), aSize: gl.createBuffer(), aOpa: gl.createBuffer() };
+let COUNT = 0;
 
-// ---- helpers ----
-const log = document.getElementById("log");
-function add(cls, html) {
-  const d = document.createElement("div"); d.className = "msg " + cls; d.innerHTML = html;
-  log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
-}
-function setState(s) {
-  const p = document.getElementById("statePill"); p.textContent = s;
-  const busy = ["GENERATING", "MORPHING", "VERIFYING", "SWAP_READY"].includes(s);
-  p.className = "pill " + (busy ? "busy" : (s === "DISPLAYED" ? "live" : ""));
-}
-function setSgf(sgf, edges) {
-  if (!sgf) return;
-  document.getElementById("sgf").textContent =
-    `SGF · ${sgf.num_gaussians} gaussians · sh${sgf.sh_degree}\n` +
-    `raw ${(sgf.raw_bytes/1024).toFixed(1)} KB · edges ${edges ?? 0}\n` +
-    `bbox ${JSON.stringify(sgf.bbox_min)}→${JSON.stringify(sgf.bbox_max)}`;
+function bindAttr(name, size) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf[name]);
+  gl.enableVertexAttribArray(loc[name]);
+  gl.vertexAttribPointer(loc[name], size, gl.FLOAT, false, 0, 0);
 }
 
-// ---- models ----
-fetch(`${API}/v1/models`).then(r => r.json()).then(d => {
-  const mp = document.getElementById("modelPill");
-  const sel = document.getElementById("model");
-  if (d.ollama_available && d.models.length) {
-    mp.innerHTML = `ollama: <b>${d.models.length} model(s)</b>`;
-    d.models.forEach(m => { const o = document.createElement("option"); o.value = m; o.textContent = m; sel.appendChild(o); });
+// --------------------------------------------------------------- mat math ----
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0];
+}
+function lookAt(eye, ctr, up) {
+  const z = norm(sub(eye, ctr)), x = norm(cross(up, z)), y = cross(z, x);
+  return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+          -dot(x,eye),-dot(y,eye),-dot(z,eye),1];
+}
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/l,a[1]/l,a[2]/l];};
+
+// ----------------------------------------------------------------- camera ----
+let yaw=0.7, pitch=0.4, dist=3.4, target=[0,0,0];
+let sizeScale=1.3, autospin=false;
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio||1, 2);
+  let w = canvas.clientWidth*dpr|0, h = canvas.clientHeight*dpr|0;
+  if (w < 10) w = 800; if (h < 10) h = 600;   // fallback if layout reports 0
+  if (canvas.width!==w || canvas.height!==h){ canvas.width=w; canvas.height=h; }
+}
+
+function draw() {
+  resize();
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(0.015,0.03,0.06,1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  if (!COUNT) return;
+  // Depth-tested "over" compositing: splats form a solid, correctly-colored
+  // surface (near wins) instead of additively summing to white.
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+  const eye = [
+    target[0] + dist*Math.cos(pitch)*Math.sin(yaw),
+    target[1] + dist*Math.sin(pitch),
+    target[2] + dist*Math.cos(pitch)*Math.cos(yaw),
+  ];
+  const fovy = 50*Math.PI/180;
+  const proj = perspective(fovy, canvas.width/canvas.height, 0.05, 100);
+  const view = lookAt(eye, target, [0,1,0]);
+  gl.uniformMatrix4fv(loc.uProj, false, proj);
+  gl.uniformMatrix4fv(loc.uView, false, view);
+  gl.uniform1f(loc.uPx, 0.5*canvas.height/Math.tan(fovy/2));
+  gl.uniform1f(loc.uSize, sizeScale);
+  gl.uniform1f(loc.uT, anim.t);
+  bindAttr("aHome",3); bindAttr("aScatter",3); bindAttr("aColor",3); bindAttr("aSize",1); bindAttr("aOpa",1);
+  gl.drawArrays(gl.POINTS, 0, COUNT);
+}
+
+// -------------------------------------------------------------- animation ----
+const anim = { t: 1, mode: "idle", from: 1, to: 1, t0: 0, dur: 1300 };
+function tween(to, dur=1300){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; }
+function stepAnim(now) {
+  if (anim.mode === "tween") {
+    const k = Math.min(1, (now - anim.t0) / anim.dur);
+    anim.t = anim.from + (anim.to - anim.from) * k;
+    if (k >= 1) anim.mode = "idle";
+  } else if (anim.mode === "cycle") {
+    // assemble(1.3s) → hold(1.0s) → disassemble(1.3s) → hold(0.7s) → repeat
+    const P = 1300+1000+1300+700;
+    const x = ((now - anim.t0) % P);
+    if (x < 1300) anim.t = x/1300;
+    else if (x < 2300) anim.t = 1;
+    else if (x < 3600) anim.t = 1 - (x-2300)/1300;
+    else anim.t = 0;
+  }
+}
+
+function loop() {
+  const now = performance.now();
+  if (autospin) yaw += 0.006;
+  stepAnim(now);
+  draw();
+}
+// setInterval (not requestAnimationFrame) so a backgrounded tab keeps rendering
+// — rAF is paused when the tab isn't visible. Foreground runs at ~60fps.
+window.__render = loop;            // debug hook
+setInterval(loop, 16);
+
+// ----------------------------------------------------------------- input ----
+let drag=null;
+canvas.addEventListener("contextmenu", e=>e.preventDefault());
+canvas.addEventListener("mousedown", e=>{ drag={x:e.clientX,y:e.clientY,pan:(e.button===2||e.shiftKey)}; });
+addEventListener("mouseup", ()=>drag=null);
+addEventListener("mousemove", e=>{
+  if(!drag) return;
+  const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
+  if(drag.pan){
+    const r=norm(cross([0,1,0],[Math.sin(yaw),0,Math.cos(yaw)]));
+    const k=dist*0.0016;
+    target[0]-=(r[0]*dx)*k; target[2]-=(r[2]*dx)*k; target[1]+=dy*k;
   } else {
-    mp.textContent = "ollama: offline";
+    yaw+=dx*0.01; pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.01));
   }
-}).catch(() => { document.getElementById("modelPill").textContent = "ollama: offline"; });
+});
+canvas.addEventListener("wheel", e=>{ e.preventDefault();
+  dist=Math.max(1.3,Math.min(9,dist*(1+e.deltaY*0.0012))); }, {passive:false});
 
-// ---- chat ----
-const send = document.getElementById("send");
-const input = document.getElementById("msg");
-async function sendMsg(text) {
-  if (!text.trim()) return;
-  add("me", text.replace(/</g, "&lt;"));
-  input.value = ""; send.disabled = true; setState("…");
-  const model = document.getElementById("model").value;
-  pullUntil = performance.now() + 4000; // keep frames flowing while it works
-  try {
-    const r = await fetch(`${API}/v1/chat`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, model: model === "heuristic" ? null : model, use_ollama: model !== "heuristic" })
-    });
-    const d = await r.json();
-    document.getElementById("enginePill").textContent = d.engine;
-    add("bot", `<span class="eng">${d.engine}</span><br>${(d.assistant || "(no reply)").replace(/</g, "&lt;")}`);
-    (d.actions || []).forEach(a => {
-      const bits = [`<b>${a.tool}</b>`, a.shape ? "shape " + a.shape : "", a.name ? a.name : "",
-                    a.ok ? "ok" : "FAILED", a.verified ? "verified" : ""].filter(Boolean).join(" · ");
-      add("act", bits);
-    });
-    setState(d.state); setSgf(d.sgf, d.edges);
-  } catch (e) {
-    add("bot", `<span class="eng">error</span><br>API unreachable: ${e}`);
-    setState("ERROR");
-  } finally {
-    pullUntil = performance.now() + 1500; dirty = true; send.disabled = false; input.focus();
+document.getElementById("spin").onclick = e=>{ autospin=!autospin; e.target.classList.toggle("on",autospin); e.target.textContent=autospin?"⏸ spin":"▶ spin"; };
+document.getElementById("reassemble").onclick = ()=>{ anim.t=0; tween(1,1500); };
+document.getElementById("cycle").onclick = e=>{
+  if(anim.mode==="cycle"){ anim.mode="idle"; tween(1,600); e.target.classList.remove("on"); }
+  else { anim.mode="cycle"; anim.t0=performance.now(); e.target.classList.add("on"); }
+};
+document.getElementById("sizeR").oninput = e=>{ sizeScale=parseFloat(e.target.value); };
+
+// ------------------------------------------------------------- cartridge ----
+function uploadModel(pos, col, size, opa) {
+  const n = size.length;
+  // scatter = exploded cloud each particle flies out from, for assemble anim
+  const scatter = new Float32Array(n*3);
+  for (let i=0;i<n;i++){
+    const x=pos[3*i],y=pos[3*i+1],z=pos[3*i+2];
+    const r=Math.hypot(x,y,z)||1, k=1.7+Math.random()*1.8;
+    scatter[3*i]  = x/r*k*1.0 + (Math.random()-0.5)*1.4;
+    scatter[3*i+1]= y/r*k*1.0 + (Math.random()-0.5)*1.4 + 0.3;
+    scatter[3*i+2]= z/r*k*1.0 + (Math.random()-0.5)*1.4;
   }
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aHome);    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aScatter); gl.bufferData(gl.ARRAY_BUFFER, scatter, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aColor);   gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aSize);    gl.bufferData(gl.ARRAY_BUFFER, size, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.aOpa);     gl.bufferData(gl.ARRAY_BUFFER, opa, gl.STATIC_DRAW);
+  COUNT = n;
+  document.getElementById("countPill").textContent = n.toLocaleString() + " particles";
 }
-document.getElementById("chat").addEventListener("submit", e => { e.preventDefault(); sendMsg(input.value); });
-document.querySelectorAll(".quick .ctl").forEach(b => b.onclick = () => sendMsg(b.dataset.q));
 
-// initial state
-fetch(`${API}/v1/state`).then(r => r.json()).then(d => { setState(d.state); setSgf(d.sgf, d.edges); }).catch(() => {});
+async function loadCartridge(animate=true) {
+  const b = await (await fetch(`${API}/v1/cartridge?_=${Date.now()}`)).arrayBuffer();
+  const dv = new DataView(b);
+  const n = dv.getUint32(0, true);
+  let o = 4;
+  const pos = new Float32Array(b, o, n*3); o += n*3*4;
+  const col = new Float32Array(b, o, n*3); o += n*3*4;
+  const size= new Float32Array(b, o, n);   o += n*4;
+  const opa = new Float32Array(b, o, n);
+  uploadModel(pos, col, size, opa);
+  if (animate && anim.mode!=="cycle"){ anim.t=0; tween(1, 1400); }
+}
+
+// ----------------------------------------------------------------- chat ----
+const log=document.getElementById("log");
+function add(cls, html){ const d=document.createElement("div"); d.className="msg "+cls; d.innerHTML=html; log.appendChild(d); log.scrollTop=log.scrollHeight; }
+function setState(s){ const p=document.getElementById("statePill"); p.textContent=s;
+  const busy=["GENERATING","MORPHING","VERIFYING","SWAP_READY"].includes(s);
+  p.className="pill "+(busy?"busy":(s==="DISPLAYED"?"live":"")); }
+function setSgf(sgf, edges){ if(!sgf) return;
+  document.getElementById("sgf").textContent =
+    `SGF · ${sgf.num_gaussians} gaussians · sh${sgf.sh_degree}\nraw ${(sgf.raw_bytes/1024).toFixed(1)} KB · edges ${edges??0}`; }
+
+fetch(`${API}/v1/models`).then(r=>r.json()).then(d=>{
+  const mp=document.getElementById("modelPill"), sel=document.getElementById("model");
+  if(d.ollama_available && d.models.length){ mp.innerHTML=`ollama: <b>${d.models.length} model(s)</b>`;
+    d.models.forEach(m=>{ const o=document.createElement("option"); o.value=m; o.textContent=m; sel.appendChild(o); }); }
+  else mp.textContent="ollama: offline";
+}).catch(()=>document.getElementById("modelPill").textContent="ollama: offline");
+
+const send=document.getElementById("send"), input=document.getElementById("msg");
+async function sendMsg(text){
+  if(!text.trim()) return;
+  add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
+  const model=document.getElementById("model").value;
+  try {
+    const r=await fetch(`${API}/v1/chat`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({message:text, model:model==="heuristic"?null:model, use_ollama:model!=="heuristic"})});
+    const d=await r.json();
+    document.getElementById("enginePill").textContent=d.engine;
+    add("bot",`<span class="eng">${d.engine}</span><br>${(d.assistant||"(no reply)").replace(/</g,"&lt;")}`);
+    (d.actions||[]).forEach(a=>{ const bits=[`<b>${a.tool}</b>`, a.shape?"shape "+a.shape:"", a.name||"",
+      a.ok?"ok":"FAILED", a.verified?"verified":""].filter(Boolean).join(" · "); add("act",bits); });
+    setState(d.state); setSgf(d.sgf, d.edges);
+    await loadCartridge(true);
+  } catch(e){ add("bot",`<span class="eng">error</span><br>API unreachable: ${e}`); setState("ERROR"); }
+  finally { send.disabled=false; input.focus(); }
+}
+document.getElementById("chat").addEventListener("submit", e=>{ e.preventDefault(); sendMsg(input.value); });
+document.querySelectorAll(".quick .ctl").forEach(b=>b.onclick=()=>sendMsg(b.dataset.q));
+
+// initial load
+fetch(`${API}/v1/state`).then(r=>r.json()).then(d=>{ setState(d.state); setSgf(d.sgf, d.edges); }).catch(()=>{});
+loadCartridge(true).catch(()=>document.getElementById("hint").textContent="Start the API: ./scripts/run_api.sh");
 </script>
 </body>
 </html>

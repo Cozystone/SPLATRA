@@ -36,7 +36,7 @@ except Exception as exc:  # pragma: no cover - api extra not installed
     ) from exc
 
 from atanor_core import build_default_engine
-from atanor_core.domain.sgf import GaussianField
+from atanor_core.domain.sgf import GaussianField, sh_dc_to_rgb
 from atanor_core.llm.heuristic import HeuristicLLM, detect_shape, sample_graph
 from atanor_core.llm.ollama import OllamaClient, list_models
 from atanor_core.state.machine import HoloState
@@ -47,7 +47,9 @@ app = FastAPI(title="atanor-hologram-core", version="0.1.0")
 _VIEWER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer")
 
 # Single-process PoC engine + in-memory job table.
-_engine = build_default_engine()
+# Large particle budget: the browser studio renders on the GPU (WebGL), so we
+# can afford dense objects; the CPU rasterizer (/v1/frame) is only a fallback.
+_engine = build_default_engine(gen_points=40000)
 _jobs: Dict[str, Dict[str, Any]] = {}
 _viewer_sockets: List["WebSocket"] = []
 _heuristic = HeuristicLLM()
@@ -322,6 +324,67 @@ def get_state() -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Live frame (the actual EWA-rendered image)
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Cartridge side channel: the raw Gaussian buffer for the WebGL viewer.
+# This is the PRD §1.2 design — heavy buffers go to the LOCAL viewer on a side
+# channel (never to the LLM). The browser renders real 3D from this.
+# --------------------------------------------------------------------------- #
+def _cartridge_arrays():
+    """Build (pos[N,3], col[N,3], size[N], opa[N]) float32 for the viewer.
+
+    Objects ship their dense field as-is. Graphs are densified for the viewer
+    only (render-time): each node gets a particle halo and each edge a strand,
+    so the knowledge graph reads as a rich particle hologram too.
+    """
+    f = _engine.field
+    pos = f.means.astype(np.float32)
+    col = np.clip(sh_dc_to_rgb(f.sh[:, 0, :]), 0.0, 1.0).astype(np.float32)
+    size = np.exp(f.scales).mean(axis=1).astype(np.float32)
+    opa = (1.0 / (1.0 + np.exp(-f.opacities))).astype(np.float32)
+
+    if not _engine._edges:
+        return pos, col, size, opa  # generated object: already dense
+
+    rng = np.random.default_rng(7)
+    P = [pos]; C = [col]; S = [size * 1.5]; O = [np.clip(opa, 0.6, 1.0)]
+    K = 130  # halo particles per node
+    for i in range(pos.shape[0]):
+        sig = max(float(size[i]) * 1.6, 0.03)
+        P.append(pos[i] + rng.normal(0, sig, size=(K, 3)).astype(np.float32))
+        C.append(np.repeat(col[i][None, :], K, 0))
+        S.append(np.full(K, float(size[i]) * 0.5, np.float32))
+        O.append(np.full(K, 0.22, np.float32))
+    M = 26  # samples per edge strand
+    s = np.linspace(0.06, 0.94, M, dtype=np.float32)[:, None]
+    for a, b in _engine._edges:
+        P.append((pos[a][None] * (1 - s) + pos[b][None] * s).astype(np.float32))
+        C.append((col[a][None] * (1 - s) + col[b][None] * s).astype(np.float32))
+        S.append(np.full(M, 0.011, np.float32))
+        O.append(np.full(M, 0.5, np.float32))
+    return (np.concatenate(P, 0), np.concatenate(C, 0),
+            np.concatenate(S, 0), np.concatenate(O, 0))
+
+
+def _pack_cartridge(pos, col, size, opa) -> bytes:
+    n = int(pos.shape[0])
+    return (
+        struct.pack("<I", n)
+        + np.ascontiguousarray(pos, np.float32).tobytes()
+        + np.ascontiguousarray(col, np.float32).tobytes()
+        + np.ascontiguousarray(size, np.float32).tobytes()
+        + np.ascontiguousarray(opa, np.float32).tobytes()
+    )
+
+
+@app.get("/v1/cartridge")
+def cartridge() -> Response:
+    if _engine.field is None:
+        raise HTTPException(status_code=409, detail="nothing rendered yet")
+    blob = _pack_cartridge(*_cartridge_arrays())
+    return Response(content=blob, media_type="application/octet-stream",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.get("/v1/frame")
 def frame(
     yaw: float = 0.6,

@@ -66,12 +66,26 @@ pip install -e ".[api]"
 
 ### Hologram Studio (chat UI)
 
-Open `http://localhost:8000` after starting the API. You get a live, orbitable
-viewport (the **actual** EWA-rendered image, dragged with the mouse) next to a
-chat box. Type what you want and a local LLM turns it into engine tool-calls:
+Open `http://localhost:8000` after starting the API. The left panel is a **real
+WebGL2 3D Gaussian point cloud** (tens of thousands of particles) that you
+**orbit (drag), zoom (scroll), and pan (right-/shift-drag)** — an actual 3D
+model rendered on your GPU, not server-side PNG frames. The browser pulls the
+Gaussian buffer once per hot-swap on a side channel (`/v1/cartridge`) and
+renders it locally. Type what you want and a local LLM turns it into tool-calls:
 
-- “show a knowledge graph with 24 nodes” → graph hologram (glowing nodes + edges)
-- “generate a torus”, “make a blue cube”, “a red spiral” → procedural 3D object
+- “show a knowledge graph with 30 nodes” → graph hologram (node halos + edge strands)
+- “generate a blue torus”, “make a red cube”, “a gold spiral” → dense 3D object
+
+Particles **assemble** (fly in and reassemble) whenever a new model loads; use
+**⟳ reassemble** to replay it and **∞ auto-cycle** to loop disassemble↔reassemble.
+A **size** slider and **▶ spin** are in the top-right.
+
+> Honesty note: the WebGL viewer draws each Gaussian as a depth-tested,
+> camera-facing **round point-sprite** with a soft falloff — a fast real-time
+> *approximation*, not the full anisotropic EWA splat (per-splat 2D covariance)
+> that `CPURasterizer`/`GsplatRasterizer` compute. The assemble/disassemble
+> motion is a client-side interpolation (scatter↔home), in the spirit of the
+> SGF morph, computed in the vertex shader.
 
 Pick an **Ollama** model from the dropdown to drive it with your local LLM
 (works even with models that lack native tool-calling, via prompted JSON mode).
@@ -139,7 +153,11 @@ hot-swap signal. The local viewer pulls the cartridge on a side channel.
 - `GET /v1/models` — installed Ollama models (`[]` if Ollama is offline).
 - `POST /v1/chat` — local-LLM tool-calling loop; runs the chosen tool, returns
   the assistant text, action records, engine state, and SGF summary.
-- `GET /v1/frame?yaw&pitch&dist&w&h` — the live EWA-rendered PNG (side channel).
+- `GET /v1/cartridge` — the raw Gaussian buffer (binary: positions, colors,
+  sizes, opacities) for the WebGL viewer. Graphs are densified (node halos +
+  edge strands) for the viewer only. **This is the side channel; never the LLM.**
+- `GET /v1/frame?yaw&pitch&dist&w&h` — a server-side EWA-rendered PNG (CPU
+  fallback / the OpenAI-plugin contract; the studio uses WebGL instead).
 - `POST /v1/render_knowledge_hologram` — graph → SGF summary + cartridge handle.
 - `POST /v1/generate_3d_object` — returns immediately with a `job_id`.
 - `GET /v1/job/{id}` — advances one tick; reports events + done + SGF summary.
@@ -152,7 +170,7 @@ src/atanor_core/   domain (SGF) · ports · mapping · deformation · generation
                    · compression · verification · state (rasterizer, machine)
                    · llm (heuristic, ollama)
 apps/plugin_api.py FastAPI + OpenAI tools schema + local-LLM chat loop
-viewer/studio.html Hologram Studio chat UI (live EWA viewport + chat), at /
+viewer/studio.html Hologram Studio: WebGL2 3D viewer + local-LLM chat, at /
 viewer/index.html  minimal standalone 2D-splat demo page
 scripts/           demo_render.py (headless) · run_api.sh
 rust/turbovec_rs/  Rust vector-indexer stub (pyo3+maturin planned)

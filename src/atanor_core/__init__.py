@@ -10,15 +10,20 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 
-def build_default_engine(coalesce_turbulence: float = 0.35):
+def build_default_engine(coalesce_turbulence: float = 0.35, gen_points: int = 2000):
     """Construct a CPU/numpy-only :class:`HologramEngine` (PoC defaults).
 
-    Adapters (all PoC / mock — see PRD §7.2):
+    Adapters (PoC — see PRD §7.2):
         mapper      -> GraphMapper (PCA fallback, no UMAP needed)
-        generator   -> MockGenerator (average-color blob; explicitly a mock)
-        rasterizer  -> CPURasterizer (painter splat; coverage, not quality)
+        generator   -> MockGenerator (procedural shaded shape; explicitly a mock)
+        rasterizer  -> CPURasterizer (real EWA splatting on CPU/numpy)
         compressor  -> MockCodec (identity + honest size estimate)
         verifier    -> PSNRGate (real PSNR over held-out views)
+
+    Args:
+        gen_points: particle budget for generated objects. Tests use the small
+            default (fast); the browser studio passes a large value (e.g. 40k)
+            since the WebGL viewer renders on the GPU, not the CPU.
     """
     from .compression.codec import MockCodec
     from .generation.generator import MockGenerator
@@ -30,7 +35,7 @@ def build_default_engine(coalesce_turbulence: float = 0.35):
     rasterizer = CPURasterizer()
     return HologramEngine(
         mapper=GraphMapper(use_umap=False),
-        generator=MockGenerator(),
+        generator=MockGenerator(n_points=gen_points),
         rasterizer=rasterizer,
         compressor=MockCodec(),
         verifier=PSNRGate(rasterizer),
