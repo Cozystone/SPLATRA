@@ -88,11 +88,21 @@ def _logit(p, eps=1e-4):
 
 
 class Image25DGenerator:
-    """Real CPU image -> oriented-surfel GaussianField (2.5D RGBD lift)."""
+    """Real CPU image -> VOLUMETRIC point-cloud GaussianField.
 
-    def __init__(self, res: int = 168, inflate: float = 0.9, sh_degree: int = 1) -> None:
+    The silhouette is filled with particles at random depths (within a
+    distance-transform thickness) plus noise diffusion — a solid 3D point cloud,
+    NOT front/back planes. Honest: depth is still single-view (symmetric about
+    the image plane), so it cannot recover an asymmetric pose — that needs the
+    multi-view GPU path (LGMGenerator).
+    """
+
+    def __init__(self, res: int = 200, inflate: float = 0.95, layers: int = 5,
+                 noise: float = 0.012, sh_degree: int = 1) -> None:
         self.res = int(res)
         self.inflate = float(inflate)   # how round the silhouette puffs out
+        self.layers = int(layers)       # particles per pixel -> fills the VOLUME
+        self.noise = float(noise)       # gaussian jitter (diffusion) per particle
         self.sh_degree = int(sh_degree)
 
     def from_image(self, image_rgb: np.ndarray) -> GaussianField:
@@ -118,46 +128,43 @@ class Image25DGenerator:
         if cov < 0.02 or cov > 0.97:     # keying failed or fills frame -> billboard
             mask = np.ones((H, W), np.float32)
 
-        # (2) INFLATION: distance-to-edge -> spherical half-thickness, so the
-        #     silhouette puffs into a CLOSED rounded volume (thick core, zero
-        #     rim). Front surface = +half (+ a little luminance relief detail),
-        #     back surface = -half; together they wrap into a solid blob.
-        lum = rgb.mean(axis=2)
+        # (2) THICKNESS field from the distance transform: how deep the solid is
+        #     at each pixel (thick core, zero rim). NOT a front/back plane — this
+        #     is used to FILL a volume with particles.
         dist = _edge_distance(mask, iters=max(40, H // 3))
-        dist = _box_blur(dist, k=max(2, W // 50), iters=2)            # smooth DT facets
+        dist = _box_blur(dist, k=max(2, W // 50), iters=2)
         t = dist / (dist.max() + 1e-6)
         half = np.sqrt(np.clip(t, 0.0, 1.0)) * self.inflate            # [H,W]
-        relief = _box_blur(mask * lum, k=max(2, W // 36), iters=2)
-        relief = (relief / (relief.max() + 1e-6)) * 0.12
-        front_z = (half + relief * mask).astype(np.float32)
-        back_z = (-half).astype(np.float32)
 
-        # surface normals from the front-z field gradient (world x=+col, y=-row)
-        gy, gx = np.gradient(front_z)
-        normals_img = np.stack([-gx, gy, np.ones_like(front_z)], axis=2)
-
-        # (3) sample masked pixels (subsample for a light cartridge)
+        # (3) sample masked pixels (cap distinct columns for a light cartridge)
         ys, xs = np.where(mask > 0.5)
         if xs.size == 0:
             ys, xs = np.mgrid[0:H, 0:W].reshape(2, -1)
-        max_pts = self.res * self.res
-        if xs.size > max_pts:
-            sel = np.random.default_rng(0).choice(xs.size, max_pts, replace=False)
+        base = self.res * self.res
+        if xs.size > base:
+            sel = np.random.default_rng(0).choice(xs.size, base, replace=False)
             xs, ys = xs[sel], ys[sel]
 
-        u = (xs / (W - 1) - 0.5) * 2.0
-        v = -(ys / (H - 1) - 0.5) * 2.0          # flip y (image down -> world up)
-        col = rgb[ys, xs]
-        nrm = normals_img[ys, xs]
+        # (4) VOLUME FILL — K particles per column at random depths in
+        #     [-half, +half] (mild surface bias). This is a true point-cloud
+        #     volume: no front/back planes, no fake paper structure.
+        rng = np.random.default_rng(1)
+        K = self.layers
+        xs_k = np.repeat(xs, K)
+        ys_k = np.repeat(ys, K)
+        u = (xs_k / (W - 1) - 0.5) * 2.0
+        v = -(ys_k / (H - 1) - 0.5) * 2.0
+        halfp = half[ys_k, xs_k]
+        a = rng.uniform(-1.0, 1.0, size=u.size).astype(np.float32)
+        zt = np.sign(a) * (np.abs(a) ** 0.7) * halfp                   # fill depth
 
-        # front + back surfaces of the inflated blob (rim closes where half→0)
-        front = np.stack([u, v, front_z[ys, xs]], axis=1).astype(np.float32)
-        back = np.stack([u, v, back_z[ys, xs]], axis=1).astype(np.float32)
-        back_nrm = nrm * np.array([1.0, 1.0, -1.0], np.float32)        # face -z
+        # (5) NOISE DIFFUSION — jitter every particle so nothing reads as a plane.
+        jit = rng.normal(0.0, self.noise, size=(u.size, 3)).astype(np.float32)
+        means = (np.stack([u, v, zt], axis=1) + jit).astype(np.float32)
 
-        means = np.concatenate([front, back], axis=0)
-        colors = np.clip(np.concatenate([col, col * 0.7], axis=0), 0.0, 1.0).astype(np.float32)
-        normals = np.concatenate([nrm, back_nrm], axis=0).astype(np.float32)
+        col = rgb[ys_k, xs_k]
+        shade = (0.62 + 0.38 * (1.0 - np.abs(zt) / (halfp + 1e-6))).astype(np.float32)
+        colors = np.clip(col * shade[:, None], 0.0, 1.0).astype(np.float32)
         n = means.shape[0]
 
         # normalize into the [-1,1] cube the viewer expects
@@ -165,12 +172,12 @@ class Image25DGenerator:
         s = (means.max(0) - means.min(0)).max() * 0.5 + 1e-6
         means = ((means - c) / s).astype(np.float32)
 
-        # (5) oriented surfels: wide in tangent plane, thin along the normal.
-        px = 1.6 / max(H, W)                       # ~pixel footprint in world
-        scales = np.log(np.tile(
-            np.array([px * 1.6, px * 1.6, px * 0.4], np.float32), (n, 1)))
-        quats = _quat_from_normal(normals)
-        opacities = np.full((n,), _logit(0.92), dtype=np.float32)
+        # (6) POINT CLOUD: small ISOTROPIC round particles (no surfels/planes).
+        px = 2.0 / max(H, W)
+        scales = np.log(np.tile(np.array([px, px, px], np.float32), (n, 1)))
+        quats = np.zeros((n, 4), dtype=np.float32)
+        quats[:, 0] = 1.0
+        opacities = np.full((n,), _logit(0.85), dtype=np.float32)
         k = (self.sh_degree + 1) ** 2
         sh = np.zeros((n, k, 3), dtype=np.float32)
         sh[:, 0, :] = rgb_to_sh_dc(colors)

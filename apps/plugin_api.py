@@ -133,18 +133,19 @@ OPENAI_TOOLS = [
         "function": {
             "name": "generate_3d_object",
             "description": (
-                "Generate a 3D object hologram from a text prompt. quality is "
-                "fast|refined; shape is sphere|cube|torus|spiral."
+                "Generate a 3D model of ANY object from a text prompt (e.g. 'a red "
+                "apple', 'a pikachu', 'a teapot'). Only set 'shape' when the user "
+                "literally asks for a geometric primitive; omit it for real objects."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string"},
+                    "prompt": {"type": "string", "description": "the object, in English"},
                     "shape": {
                         "type": "string",
                         "enum": ["sphere", "cube", "torus", "spiral"],
+                        "description": "only for literal geometric primitives",
                     },
-                    "quality": {"type": "string", "enum": ["fast", "refined"]},
                 },
                 "required": ["prompt"],
             },

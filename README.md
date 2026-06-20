@@ -36,11 +36,12 @@ mock is dressed up as real.
   the procedural mock with an explicit note (it never silently pretends). Model
   IDs / activation conventions must be re-verified at wiring time.
 - **`Image25DGenerator` is a real CPU image→3D** (`generation/image_lift.py`):
-  a 2.5D RGBD lift (numpy + Pillow, no weights, ~20ms) — foreground keying,
-  relief-depth estimate, normals from the depth gradient, unprojection to
-  oriented-surfel Gaussians + a dim back-shell for volume. It is the default
-  image→3D path (runs anywhere). **Honest:** it reconstructs the *visible relief*
-  (silhouette-accurate, rounded), not unseen geometry — that's the GPU LGM path.
+  foreground cutout → distance-transform thickness → the silhouette volume is
+  **filled with a noise-diffused point cloud** (K particles per column at random
+  depths within ±thickness). A true volumetric particle cloud — **no front/back
+  planes, no fake paper structure** — ~50–130k points. **Honest:** depth is
+  single-view (symmetric about the image plane), so it cannot recover an
+  asymmetric pose; that needs the multi-view GPU `LGMGenerator`.
 - **`MockGenerator` is the CPU default** for text prompts — a *procedural* oriented-surfel shape
   (sphere/cube/torus/spiral, Lambert-lit, color-word tinted). Explicitly **not**
   image-to-3D reconstruction; it gives the state machine a plausibly-3D field.

@@ -36,11 +36,14 @@ SYSTEM_PROMPT = (
 JSON_PROMPT = (
     "You control a 3D Gaussian hologram engine. For the user's request, choose "
     "exactly ONE tool and reply with ONLY a JSON object (no prose, no markdown):\n"
-    '1) {"tool":"generate_3d_object","arguments":{"prompt":"<text>",'
-    '"shape":"sphere|cube|torus|spiral"}}  — to make/show a 3D object.\n'
+    '1) {"tool":"generate_3d_object","arguments":{"prompt":"<the object in '
+    'English, e.g. a red apple, a pikachu, a teapot>"}}  — to create a 3D model '
+    "of ANY object from a description. Translate the object to English. Do NOT "
+    'add a "shape" field unless the user literally asks for a geometric primitive '
+    '(then add "shape":"sphere|cube|torus|spiral").\n'
     '2) {"tool":"render_knowledge_hologram","arguments":{"_sample_n":<int 3-120>}}'
     "  — to visualize a knowledge graph / network of N nodes.\n"
-    "Pick the closest shape. Output one JSON object of that exact form."
+    "Output one JSON object of that exact form."
 )
 
 
