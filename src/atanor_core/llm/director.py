@@ -31,17 +31,21 @@ import re
 from typing import Any, Dict, List, Optional
 
 _SYS = (
-    "You direct a 3D particle model while narrating. Output ONLY JSON: a list of "
-    "4-8 steps. Each step is {{\"say\": \"<short phrase in {lang}>\", \"action\": "
-    "{{...}}}}. Action types: "
-    "{{\"type\":\"focus\",\"yaw\":<rad>,\"pitch\":<rad>,\"dist\":<2..4>,\"ms\":1200}}, "
-    "{{\"type\":\"spin\",\"ms\":1500}}, "
-    "{{\"type\":\"charge\",\"center\":[x,y,z],\"ms\":1500}}, "
-    "{{\"type\":\"discharge\",\"center\":[x,y,z],\"ms\":700}}, "
-    "{{\"type\":\"pulse\",\"ms\":600}}, {{\"type\":\"none\"}}. "
-    "center is a point in the model's [-1,1] cube (e.g. a tail ~ [0.0,-0.3,-0.5]). "
-    "Split the explanation so each short phrase lines up with its visual. "
-    "Explain: {topic}"
+    "You are a 3D explainer. A particle model of the subject is on screen and YOU "
+    "decide how to manipulate it to teach. Output ONLY JSON: a list of 5-9 steps, "
+    "each {{\"say\":\"<short phrase in {lang}>\",\"action\":{{...}}}}. Compose the "
+    "actions freely — pick whatever explains '{topic}' best:\n"
+    "- focus {{\"type\":\"focus\",\"yaw\":<rad>,\"pitch\":<rad>,\"dist\":<2.2..3.6>,\"ms\":1200}} rotate/zoom to a part\n"
+    "- spin {{\"type\":\"spin\",\"ms\":1600}} slow turntable\n"
+    "- scale {{\"type\":\"scale\",\"to\":<0.3..1.8>,\"ms\":900}} shrink/grow to compare or zoom out\n"
+    "- arrow {{\"type\":\"arrow\",\"from\":[x,y,z],\"to\":[x,y,z],\"ms\":3000}} point at a part, or show a force / flow / direction in the air\n"
+    "- label {{\"type\":\"label\",\"at\":[x,y,z],\"text\":\"<short>\",\"ms\":3500}} name a feature\n"
+    "- charge {{\"type\":\"charge\",\"center\":[x,y,z],\"ms\":1500}} & discharge {{\"type\":\"discharge\",\"center\":[x,y,z],\"ms\":700}} energy / force / emission effect\n"
+    "- pulse {{\"type\":\"pulse\",\"ms\":600}}, none.\n"
+    "Coordinates are points in the model's [-1,1] cube. Make each short phrase line "
+    "up with its visual so it plays like a live lecture. Be specific to the subject "
+    "(use arrows for forces in physics, labels for parts in anatomy/architecture, "
+    "scale to compare, focus to inspect). Explain: {topic}"
 )
 
 
