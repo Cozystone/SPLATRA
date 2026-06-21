@@ -94,6 +94,16 @@ def _mv():
 
 app = FastAPI(title="atanor-hologram-core", version="0.1.0")
 
+# Allow the static Vercel viewer (or any browser) to call this local GPU server.
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
 _VIEWER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer")
 
 # Single-process PoC engine + in-memory job table.

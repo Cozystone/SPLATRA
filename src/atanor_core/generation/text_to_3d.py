@@ -103,9 +103,9 @@ class TextTo3DGenerator:
         """prompt -> [H,W,3] float image (isolated subject on plain background)."""
         self._ensure()
         prompt = _translate(prompt)
-        full = (f"a single {prompt}, centered, isolated on a plain solid white "
-                "background, full object in frame, vivid saturated colors, detailed, "
-                "product photo, soft studio lighting")
+        full = (f"a single {prompt}, the entire object fully visible and centered, "
+                "not cropped, isolated on a plain solid white background, vivid "
+                "saturated colors, sharp detail, clean studio product photo, even lighting")
         kw = dict(num_inference_steps=self.steps, height=self.size, width=self.size)
         if self._turbo:
             kw["guidance_scale"] = 0.0           # turbo models are CFG-free

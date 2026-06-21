@@ -31,8 +31,8 @@ _TRIPOSR_DIR = os.environ.get("SPLATRA_TRIPOSR_DIR", "")
 
 
 class TripoSRGenerator:
-    def __init__(self, grid: int = 192, threshold: float = 25.0,
-                 n_points: int = 170_000, sh_degree: int = 0) -> None:
+    def __init__(self, grid: int = 256, threshold: float = 22.0,
+                 n_points: int = 220_000, sh_degree: int = 0) -> None:
         self.grid = int(grid)
         self.threshold = float(threshold)
         self.n_points = int(n_points)
