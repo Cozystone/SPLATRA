@@ -104,6 +104,28 @@ try:
 except Exception:  # pragma: no cover
     pass
 
+
+@app.on_event("startup")
+def _prewarm_models() -> None:
+    """Load the GPU generators in the background at startup so the FIRST user
+    request is fast (no cold model load mid-request)."""
+    if not (_USE_TRIPOSR or _USE_MV or _USE_SD):
+        return
+
+    def warm():
+        try:
+            if _USE_SD or _USE_TRIPOSR or _USE_MV:
+                _sd()._ensure()          # SD-Turbo (conditioning image for all)
+            if _USE_TRIPOSR:
+                _triposr()._ensure()     # TripoSR triplane model
+            elif _USE_MV:
+                _mv()._ensure()          # Zero123++
+        except Exception:
+            pass
+
+    import threading
+    threading.Thread(target=warm, daemon=True).start()
+
 _VIEWER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer")
 
 # Single-process PoC engine + in-memory job table.

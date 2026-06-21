@@ -474,8 +474,14 @@ function isExplain(t){
   const s=t.toLowerCase();
   return /\?|어떻게|왜 |무엇|원리|작동|설명|알려|대해|소개|특징|기능|능력|explain|describe|how |why |what (is|are|does)|tell me about/.test(s);
 }
+function noBackend(text){
+  add("me", text.replace(/</g,"&lt;")); input.value="";
+  add("bot","⚠ <b>no generation backend.</b> This static demo only shows baked samples. To generate, open this page on your GPU PC as <b>?api=http://127.0.0.1:8000</b> (or your tunnel URL). Loading a sample…");
+  loadSample("pikachu");
+}
 async function sendMsg(text){
   if(!text.trim()) return;
+  if(!ONLINE) return noBackend(text);
   if(isExplain(text)){ return narrate(text); }    // auto-route to narration
   add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
   disassemble();   // current model bursts into particles + swirls while generating
@@ -529,6 +535,7 @@ async function playScript(steps){
 const narrBtn=document.getElementById("narr");
 async function narrate(text){
   if(!text.trim()) return;
+  if(!ONLINE) return noBackend(text);
   add("me", "🎙 "+text.replace(/</g,"&lt;")); input.value=""; narrBtn.disabled=send.disabled=true; setState("…");
   disassemble();
   const model=document.getElementById("model").value;
