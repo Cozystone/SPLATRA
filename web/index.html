@@ -163,7 +163,7 @@ layout(location=0) in vec2 aCorner;     // quad corner in {-1,1}
 layout(location=1) in uint aIndex;       // sorted splat index (back-to-front)
 uniform sampler2D uData; uniform int uTexW;
 uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
-uniform float uT, uSizeScale, uTime, uModelScale;
+uniform float uT, uSizeScale, uTime, uModelScale, uSwirl;
 uniform int uFxMode; uniform vec3 uFxCenter; uniform float uFxAmt;  // narration FX
 out vec3 vColor; out float vOpacity; out vec2 vQuad; out float vGlow;
 
@@ -176,22 +176,16 @@ void main(){
   vec4 t0 = texel(base), t1 = texel(base+1), t2 = texel(base+2), t3 = texel(base+3);
   vec3 home = t0.xyz; float opacity = t0.w; vec3 color = t1.xyz;
 
-  // FREE but SMOOTH disassemble/reassemble — every particle flows its own gentle path.
-  float e = smoothstep(0.0, 1.0, uT); e = smoothstep(0.0, 1.0, e);   // double-smooth ease in/out
-  vec3 h  = hash3(home*1.7 + 3.1);
-  vec3 h2 = hash3(home*2.9 + 11.3);
-  // a free 3D scatter cloud (whole volume, but a moderate, calm spread)
-  vec3 scatter = home + (h-0.5)*1.7 + (h2-0.5)*0.7;
-  vec3 off = mix(scatter, home, e) - home;          // displacement from settle point
-  // gentle per-particle swirl about a random axis (mixed CW/CCW), slow continuous drift
-  vec3 axis = normalize(h2 - 0.5 + vec3(1e-4));
-  float sgn = (h.x < 0.5) ? 1.0 : -1.0;
-  float spin = (1.0 - e) * ((0.6 + 1.8*h.z)*sgn + uTime*sgn*0.12);
-  off = rotAxis(off, axis, spin);
-  // soft mid-flight drift (smooth, peaks gently mid-transition)
-  float burst = (1.0 - e) * e * 3.2;
-  off += (h2 - 0.5) * burst * 0.25;
-  vec3 pos = home + off;
+  // rotation-style disassemble/reassemble: a single continuous Y-spin — a half
+  // turn out while it scatters, then ANOTHER half turn (same direction) in while
+  // it reassembles (one full turn total, not a wind/unwind reverse).
+  float e = smoothstep(0.0, 1.0, uT); e = smoothstep(0.0, 1.0, e);
+  vec3 h = hash3(home + 0.123);
+  vec3 dir = normalize(home + vec3(1e-4));
+  vec3 scatter = home + dir*(0.7 + 1.2*h.x) + (h - 0.5)*1.4;
+  vec3 pos = mix(scatter, home, e);
+  float ca = cos(uSwirl), sa = sin(uSwirl);
+  pos.xz = mat2(ca, -sa, sa, ca) * pos.xz;
 
   // narration FX: charge (gather + glow), discharge (burst), pulse (glow all)
   vGlow = 0.0;
@@ -262,7 +256,7 @@ if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(pro
 gl.useProgram(prog);
 
 const U = {};
-["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uSwirl","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
 // quad corners (triangle strip) + per-instance index buffer
 const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -298,6 +292,12 @@ function camTo(y,p,d,ms){ cam.active=true; cam.fy=yaw; cam.fp=pitch; cam.fd=dist
 // model scale (LLM can shrink/grow) — animated
 let modelScale=1; const ms={active:false,f:1,t:1,t0:0,dur:800};
 function scaleTo(s,dur){ ms.active=true; ms.f=modelScale; ms.t=s; ms.t0=performance.now(); ms.dur=dur||800; }
+// rotation-style morph: a single monotonic Y-spin (half turn out, half turn in).
+const TWO_PI=2*Math.PI; let swirl=0; const sw={active:false,f:0,t:0,t0:0,dur:800};
+function swirlTo(target,dur){ sw.active=true; sw.f=swirl; sw.t=target; sw.t0=performance.now(); sw.dur=dur||800; }
+function swirlSettle(dur){ // round up to the next full turn so the model lands upright
+  const aligned=Math.abs(swirl/TWO_PI-Math.round(swirl/TWO_PI))<0.02;
+  swirlTo(aligned?swirl:Math.ceil(swirl/TWO_PI-1e-6)*TWO_PI, dur||1700); }
 // 3D overlays: arrows + labels that float in space (LLM "허공에 화살표 / 라벨")
 const overlays=[]; const ovEl=document.getElementById("ov"), ovSvg=document.getElementById("ovsvg");
 function project(p, proj, view){
@@ -334,7 +334,9 @@ function tween(to,dur=1400,next=null){ anim.mode="tween"; anim.from=anim.t; anim
 // swirling while the next model generates; loadCartridge() then assembles the new one.
 let _baseDist=null;
 function disassemble(){ if(typeof clearOverlays==="function"){ clearOverlays(); scaleTo(1,400); }
-  if(COUNT){ _baseDist=dist; camTo(yaw, pitch, Math.min(dist*1.35, 8.5), 800); tween(0, 800, "scatter"); } }
+  if(COUNT){ _baseDist=dist; camTo(yaw, pitch, Math.min(dist*1.35, 8.5), 800);
+    swirlTo(swirl + Math.PI, 800);                 // half-turn out
+    tween(0, 800, "scatter"); } }
 
 function resize(){
   const dpr=Math.min(devicePixelRatio||1,2);
@@ -431,6 +433,9 @@ function frame(){
     if(k>=1) cam.active=false; }
   if(ms.active){ const k=Math.min(1,(now-ms.t0)/ms.dur), e=k*k*(3-2*k);
     modelScale=ms.f+(ms.t-ms.f)*e; if(k>=1) ms.active=false; }
+  if(sw.active){ const k=Math.min(1,(now-sw.t0)/sw.dur), e=k*k*(3-2*k);
+    swirl=sw.f+(sw.t-sw.f)*e; if(k>=1) sw.active=false; }
+  else if(anim.mode==="scatter") swirl += 0.004;   // gentle continuous spin while waiting (same direction)
 
   resize();
   gl.viewport(0,0,canvas.width,canvas.height);
@@ -454,7 +459,7 @@ function frame(){
     gl.uniform2f(U.uFocal, proj[0]*0.5*canvas.width, proj[5]*0.5*canvas.height);
     gl.uniform2f(U.uViewport, canvas.width, canvas.height);
     gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale); gl.uniform1f(U.uTime, now*0.001);
-    gl.uniform1f(U.uModelScale, modelScale);
+    gl.uniform1f(U.uModelScale, modelScale); gl.uniform1f(U.uSwirl, swirl);
     gl.uniform1i(U.uFxMode, fx.mode); gl.uniform3fv(U.uFxCenter, fx.center); gl.uniform1f(U.uFxAmt, fx.amt);
     updateOverlays(proj, view);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
@@ -498,7 +503,7 @@ async function loadCartridge(animate=true, url=null){
   const quat=new Float32Array(b,o,n*4); o+=n*16;
   const opa=new Float32Array(b,o,n);
   uploadModel(pos,col,scale,quat,opa);
-  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700);
+  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700); swirlSettle(1700);  // another half-turn in, same direction
     if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
 }
 
