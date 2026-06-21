@@ -113,6 +113,11 @@
       <button class="ctl" data-q="generate a gold spiral">gold spiral</button>
       <button class="ctl" data-q="a green sphere">green sphere</button>
     </div>
+    <div class="quick" style="padding-top:2px"><span style="color:var(--muted);font-size:11px;align-self:center">samples:</span>
+      <button class="ctl" data-sample="pikachu">pikachu (TripoSR)</button>
+      <button class="ctl" data-sample="torus">blue torus</button>
+      <button class="ctl" data-sample="graph">graph</button>
+    </div>
     <div id="rate" style="display:none; padding:0 12px 4px; font-size:11px; color:var(--muted);">
       <span id="autoScore"></span>
       rate this 3D: <input id="rateR" type="range" min="0" max="100" value="80" style="width:120px; vertical-align:middle">
@@ -134,7 +139,9 @@
 </main>
 
 <script>
-const API = location.origin;
+// Backend base: ?api=http://host:8000 to point a static deploy at your GPU box.
+const API = new URLSearchParams(location.search).get("api") || location.origin;
+let ONLINE = false;   // is a generation backend reachable?
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias:false, premultipliedAlpha:true, alpha:false });
 if (!gl) document.getElementById("hint").textContent = "WebGL2 not available.";
@@ -386,8 +393,9 @@ document.getElementById("cycle").onclick = e=>{ if(anim.mode==="cycle"){ anim.mo
 document.getElementById("sizeR").oninput = e=>{ sizeScale=parseFloat(e.target.value); };
 
 // ============================================================= cartridge ====
-async function loadCartridge(animate=true){
-  const b = await (await fetch(`${API}/v1/cartridge?_=${Date.now()}`)).arrayBuffer();
+async function loadCartridge(animate=true, url=null){
+  const u = url || `${API}/v1/cartridge?_=${Date.now()}`;
+  const b = await (await fetch(u)).arrayBuffer();
   const dv = new DataView(b);
   // magic "SPL2" (4 bytes) + uint32 N
   const n = dv.getUint32(4, true);
@@ -478,7 +486,23 @@ async function uploadImage(file){
 }
 
 // initial
-fetch(`${API}/v1/state`).then(r=>r.json()).then(d=>{ setState(d.state); setSgf(d.sgf,d.edges); }).catch(()=>{});
+// Static-deploy samples (no backend): pre-baked cartridges, morph between them.
+function loadSample(n){ disassemble(); setTimeout(()=>loadCartridge(true, `samples/${n}.bin`).catch(()=>{}), 520); }
+document.querySelectorAll("[data-sample]").forEach(b=>b.onclick=()=>loadSample(b.dataset.sample));
+
+(async function init(){
+  try{
+    const s=await fetch(`${API}/v1/state`,{signal:AbortSignal.timeout(2500)});
+    if(s.ok){ const d=await s.json(); setState(d.state); setSgf(d.sgf,d.edges); ONLINE=true; }
+  }catch(e){}
+  if(ONLINE){ loadCartridge(true).catch(()=>{}); }
+  else {
+    document.getElementById("hint").textContent="static demo — orbit the baked models; connect a GPU backend with ?api=http://host:8000 to generate";
+    document.getElementById("msg").placeholder="add ?api=<your GPU server> to generate…";
+    document.getElementById("enginePill").textContent="offline (samples)";
+    loadCartridge(true, "samples/pikachu.bin").catch(()=>{ document.getElementById("hint").textContent="add /viewer/samples/*.bin or run the API"; });
+  }
+})();
 loadCartridge(true).catch(()=>document.getElementById("hint").textContent="Start the API: python -m uvicorn apps.plugin_api:app --port 8000");
 </script>
 </body>
