@@ -154,26 +154,35 @@ layout(location=0) in vec2 aCorner;     // quad corner in {-1,1}
 layout(location=1) in uint aIndex;       // sorted splat index (back-to-front)
 uniform sampler2D uData; uniform int uTexW;
 uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
-uniform float uT, uSizeScale;
+uniform float uT, uSizeScale, uTime;
 uniform int uFxMode; uniform vec3 uFxCenter; uniform float uFxAmt;  // narration FX
 out vec3 vColor; out float vOpacity; out vec2 vQuad; out float vGlow;
 
 vec4 texel(int p){ return texelFetch(uData, ivec2(p % uTexW, p / uTexW), 0); }
 vec3 hash3(vec3 p){ p = fract(p*vec3(443.897,441.423,437.195)); p += dot(p, p.yzx+19.19); return fract((p.xxy+p.yzz)*p.zyx); }
+vec3 rotAxis(vec3 p, vec3 ax, float a){ float c=cos(a), s=sin(a); return p*c + cross(ax,p)*s + ax*dot(ax,p)*(1.0-c); }
 
 void main(){
   int base = int(aIndex)*4;
   vec4 t0 = texel(base), t1 = texel(base+1), t2 = texel(base+2), t3 = texel(base+3);
   vec3 home = t0.xyz; float opacity = t0.w; vec3 color = t1.xyz;
 
-  // assemble/disassemble morph: scatter <-> home with an unwinding swirl
+  // FREE disassemble/reassemble: every particle takes its own path through space.
   float e = uT*uT*(3.0-2.0*uT);
-  vec3 h = hash3(home + 0.123);
-  vec3 dir = normalize(home + vec3(1e-4));
-  vec3 scatter = home + dir*(0.8 + 1.4*h.x) + (h-0.5)*1.7;
-  vec3 pos = mix(scatter, home, e);
-  float ang = (1.0-e)*2.6; float ca = cos(ang), sa = sin(ang);
-  pos.xz = mat2(ca,-sa,sa,ca) * pos.xz;
+  vec3 h  = hash3(home*1.7 + 3.1);
+  vec3 h2 = hash3(home*2.9 + 11.3);
+  // a free 3D scatter cloud (uses the whole volume, not a radial shell)
+  vec3 scatter = home + (h-0.5)*2.7 + (h2-0.5)*1.3 + vec3(0.0, 0.6*(h.y-0.5), 0.0);
+  vec3 off = mix(scatter, home, e) - home;          // displacement from settle point
+  // per-particle swirl about a RANDOM axis, mixed CW/CCW, varied speed + phase
+  vec3 axis = normalize(h2 - 0.5 + vec3(1e-4));
+  float sgn = (h.x < 0.5) ? 1.0 : -1.0;
+  float spin = (1.0 - e) * ((1.2 + 4.5*h.z)*sgn + uTime*sgn*0.5);   // varied + gentle continuous drift
+  off = rotAxis(off, axis, spin);
+  // organic mid-flight curl drift (peaks mid-transition, zero at both ends)
+  float burst = (1.0 - e) * e * 4.0;
+  off += (h2 - 0.5) * burst * 0.55;
+  vec3 pos = home + off;
 
   // narration FX: charge (gather + glow), discharge (burst), pulse (glow all)
   vGlow = 0.0;
@@ -212,7 +221,9 @@ void main(){
   vec2 major = min(3.0*sqrt(l1), 256.0) * e1;
   vec2 minor = min(3.0*sqrt(l2), 256.0) * e2;
 
-  vColor = color; vOpacity = opacity; vQuad = aCorner;
+  // colors EMERGE as the form settles (soft glow while scattered -> true color)
+  vColor = mix(vec3(0.78, 0.86, 1.0), color, smoothstep(0.15, 0.92, e));
+  vOpacity = opacity; vQuad = aCorner;
   vec2 ndc = clip.xy / clip.w;
   vec2 offset = (aCorner.x*major + aCorner.y*minor) * 2.0 / uViewport;
   gl_Position = vec4(ndc + offset, clip.z/clip.w, 1.0);
@@ -240,7 +251,7 @@ if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(pro
 gl.useProgram(prog);
 
 const U = {};
-["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
 // quad corners (triangle strip) + per-instance index buffer
 const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -277,7 +288,8 @@ const anim = { t:1, mode:"idle", from:1, to:1, t0:0, dur:1400, next:null };
 function tween(to,dur=1400,next=null){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; anim.next=next; }
 // inter-model transition: explode the CURRENT model into particles and keep it
 // swirling while the next model generates; loadCartridge() then assembles the new one.
-function disassemble(){ if(COUNT){ tween(0, 750, "scatter"); } }
+let _baseDist=null;
+function disassemble(){ if(COUNT){ _baseDist=dist; camTo(yaw, pitch, Math.min(dist*1.35, 8.5), 800); tween(0, 800, "scatter"); } }
 
 function resize(){
   const dpr=Math.min(devicePixelRatio||1,2);
@@ -394,7 +406,7 @@ function frame(){
     gl.uniformMatrix4fv(U.uProj,false,proj); gl.uniformMatrix4fv(U.uView,false,view);
     gl.uniform2f(U.uFocal, proj[0]*0.5*canvas.width, proj[5]*0.5*canvas.height);
     gl.uniform2f(U.uViewport, canvas.width, canvas.height);
-    gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale);
+    gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale); gl.uniform1f(U.uTime, now*0.001);
     gl.uniform1i(U.uFxMode, fx.mode); gl.uniform3fv(U.uFxCenter, fx.center); gl.uniform1f(U.uFxAmt, fx.amt);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
   }
@@ -437,7 +449,8 @@ async function loadCartridge(animate=true, url=null){
   const quat=new Float32Array(b,o,n*4); o+=n*16;
   const opa=new Float32Array(b,o,n);
   uploadModel(pos,col,scale,quat,opa);
-  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1500); }
+  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700);
+    if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
 }
 
 // ============================================================= chat =========
@@ -456,8 +469,14 @@ fetch(`${API}/v1/models`).then(r=>r.json()).then(d=>{
 }).catch(()=>document.getElementById("modelPill").textContent="ollama: offline");
 
 const send=document.getElementById("send"), input=document.getElementById("msg");
+// free intent routing: a question / "explain" -> narrate; a build command -> generate.
+function isExplain(t){
+  const s=t.toLowerCase();
+  return /\?|어떻게|왜 |무엇|원리|작동|설명|알려|대해|소개|특징|기능|능력|explain|describe|how |why |what (is|are|does)|tell me about/.test(s);
+}
 async function sendMsg(text){
   if(!text.trim()) return;
+  if(isExplain(text)){ return narrate(text); }    // auto-route to narration
   add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
   disassemble();   // current model bursts into particles + swirls while generating
   const model=document.getElementById("model").value;
@@ -479,11 +498,22 @@ document.querySelectorAll(".quick .ctl").forEach(b=>b.onclick=()=>sendMsg(b.data
 
 // ============================================================= narration ====
 // JARVIS mode: build the model, then speak (TTS) while firing synced visual cues.
+let _voices=[];
+function _loadVoices(){ try{ _voices=speechSynthesis.getVoices()||[]; }catch(e){} }
+if(window.speechSynthesis){ _loadVoices(); speechSynthesis.onvoiceschanged=_loadVoices; }
 function speak(text){ return new Promise(res=>{
-  if(!text || !window.speechSynthesis){ setTimeout(res, Math.max(500, (text||"").length*70)); return; }
-  try{ const u=new SpeechSynthesisUtterance(text); u.lang=(/[가-힣]/.test(text))?"ko-KR":"en-US"; u.rate=1.0; u.pitch=1.0;
-    u.onend=res; u.onerror=res; speechSynthesis.cancel(); speechSynthesis.speak(u);
-  }catch(e){ setTimeout(res, 900); } }); }
+  const dur = Math.max(900, (text||"").length*140);          // guaranteed pacing if TTS is silent
+  if(!text || !window.speechSynthesis){ setTimeout(res, dur); return; }
+  let done=false; const finish=()=>{ if(!done){ done=true; res(); } };
+  const safety=setTimeout(finish, dur+1500);                  // never get stuck on a missing voice
+  try{
+    const ko=/[가-힣]/.test(text);
+    const u=new SpeechSynthesisUtterance(text); u.lang=ko?"ko-KR":"en-US"; u.rate=1.0;
+    const v=_voices.find(v=>v.lang && v.lang.toLowerCase().startsWith(ko?"ko":"en")); if(v) u.voice=v;
+    u.onend=()=>{ clearTimeout(safety); finish(); };
+    u.onerror=()=>{ clearTimeout(safety); finish(); };
+    speechSynthesis.speak(u);
+  }catch(e){ clearTimeout(safety); setTimeout(finish, dur); } }); }
 function runAction(a){
   if(!a||!a.type) return;
   if(a.type==="focus") camTo(a.yaw??yaw, a.pitch??pitch, a.dist??dist, a.ms??1200);
