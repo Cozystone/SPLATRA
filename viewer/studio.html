@@ -248,8 +248,11 @@ const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l
 
 // ============================================================= camera =======
 let yaw=0.7, pitch=0.4, dist=3.4, target=[0,0,0], sizeScale=1.0, autospin=false;
-const anim = { t:1, mode:"idle", from:1, to:1, t0:0, dur:1400 };
-function tween(to,dur=1400){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; }
+const anim = { t:1, mode:"idle", from:1, to:1, t0:0, dur:1400, next:null };
+function tween(to,dur=1400,next=null){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; anim.next=next; }
+// inter-model transition: explode the CURRENT model into particles and keep it
+// swirling while the next model generates; loadCartridge() then assembles the new one.
+function disassemble(){ if(COUNT){ tween(0, 750, "scatter"); } }
 
 function resize(){
   const dpr=Math.min(devicePixelRatio||1,2);
@@ -328,7 +331,8 @@ function frame(){
   if(autospin) yaw+=0.006;
   // animation
   if(anim.mode==="tween"){ const k=Math.min(1,(now-anim.t0)/anim.dur);
-    anim.t=anim.from+(anim.to-anim.from)*k; if(k>=1)anim.mode="idle"; }
+    anim.t=anim.from+(anim.to-anim.from)*k; if(k>=1){ anim.mode=anim.next||"idle"; anim.next=null; } }
+  else if(anim.mode==="scatter"){ anim.t = 0.10 + 0.05*Math.sin(now*0.0016); } // swirl while generating
   else if(anim.mode==="cycle"){ const P=1400+1000+1400+700, x=(now-anim.t0)%P;
     anim.t = x<1400 ? x/1400 : x<2400 ? 1 : x<3800 ? 1-(x-2400)/1400 : 0; }
 
@@ -416,6 +420,7 @@ const send=document.getElementById("send"), input=document.getElementById("msg")
 async function sendMsg(text){
   if(!text.trim()) return;
   add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
+  disassemble();   // current model bursts into particles + swirls while generating
   const model=document.getElementById("model").value;
   try{
     const r=await fetch(`${API}/v1/chat`,{method:"POST",headers:{"Content-Type":"application/json"},
@@ -460,6 +465,7 @@ fileInput.onchange=()=>{ if(fileInput.files[0]) uploadImage(fileInput.files[0]);
   if(ev==="drop"&&e.dataTransfer.files[0]) uploadImage(e.dataTransfer.files[0]); }));
 async function uploadImage(file){
   add("me", `🖼️ ${file.name} → image-to-3D`); setState("…");
+  disassemble();
   const fd=new FormData(); fd.append("image", file);
   try{
     const r=await fetch(`${API}/v1/generate_from_image`, {method:"POST", body:fd});
