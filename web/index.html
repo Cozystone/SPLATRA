@@ -87,6 +87,10 @@
 <main>
   <section id="stage">
     <canvas id="gl"></canvas>
+    <svg id="ovsvg" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#39e6c6"/></marker></defs></svg>
+    <div id="ov" style="position:absolute;inset:0;pointer-events:none"></div>
     <div id="sgf" class="overlay">SGF —</div>
     <div id="tools">
       <button class="ctl" id="spin">▶ spin</button>
@@ -140,8 +144,13 @@
 </main>
 
 <script>
-// Backend base: ?api=http://host:8000 to point a static deploy at your GPU box.
-const API = new URLSearchParams(location.search).get("api") || location.origin;
+// Backend base. Priority: ?api=… → same origin (local server) → auto-probe the
+// local GPU server (so opening the Vercel page ON the GPU PC just works).
+let API = new URLSearchParams(location.search).get("api");
+if (!API) {
+  const local = (location.hostname === "127.0.0.1" || location.hostname === "localhost");
+  API = local ? location.origin : "http://127.0.0.1:8000";   // remote page -> try the local GPU box
+}
 let ONLINE = false;   // is a generation backend reachable?
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl2", { antialias:false, premultipliedAlpha:true, alpha:false });
@@ -154,7 +163,7 @@ layout(location=0) in vec2 aCorner;     // quad corner in {-1,1}
 layout(location=1) in uint aIndex;       // sorted splat index (back-to-front)
 uniform sampler2D uData; uniform int uTexW;
 uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
-uniform float uT, uSizeScale, uTime;
+uniform float uT, uSizeScale, uTime, uModelScale;
 uniform int uFxMode; uniform vec3 uFxCenter; uniform float uFxAmt;  // narration FX
 out vec3 vColor; out float vOpacity; out vec2 vQuad; out float vGlow;
 
@@ -167,21 +176,21 @@ void main(){
   vec4 t0 = texel(base), t1 = texel(base+1), t2 = texel(base+2), t3 = texel(base+3);
   vec3 home = t0.xyz; float opacity = t0.w; vec3 color = t1.xyz;
 
-  // FREE disassemble/reassemble: every particle takes its own path through space.
-  float e = uT*uT*(3.0-2.0*uT);
+  // FREE but SMOOTH disassemble/reassemble — every particle flows its own gentle path.
+  float e = smoothstep(0.0, 1.0, uT); e = smoothstep(0.0, 1.0, e);   // double-smooth ease in/out
   vec3 h  = hash3(home*1.7 + 3.1);
   vec3 h2 = hash3(home*2.9 + 11.3);
-  // a free 3D scatter cloud (uses the whole volume, not a radial shell)
-  vec3 scatter = home + (h-0.5)*2.7 + (h2-0.5)*1.3 + vec3(0.0, 0.6*(h.y-0.5), 0.0);
+  // a free 3D scatter cloud (whole volume, but a moderate, calm spread)
+  vec3 scatter = home + (h-0.5)*1.7 + (h2-0.5)*0.7;
   vec3 off = mix(scatter, home, e) - home;          // displacement from settle point
-  // per-particle swirl about a RANDOM axis, mixed CW/CCW, varied speed + phase
+  // gentle per-particle swirl about a random axis (mixed CW/CCW), slow continuous drift
   vec3 axis = normalize(h2 - 0.5 + vec3(1e-4));
   float sgn = (h.x < 0.5) ? 1.0 : -1.0;
-  float spin = (1.0 - e) * ((1.2 + 4.5*h.z)*sgn + uTime*sgn*0.5);   // varied + gentle continuous drift
+  float spin = (1.0 - e) * ((0.6 + 1.8*h.z)*sgn + uTime*sgn*0.12);
   off = rotAxis(off, axis, spin);
-  // organic mid-flight curl drift (peaks mid-transition, zero at both ends)
-  float burst = (1.0 - e) * e * 4.0;
-  off += (h2 - 0.5) * burst * 0.55;
+  // soft mid-flight drift (smooth, peaks gently mid-transition)
+  float burst = (1.0 - e) * e * 3.2;
+  off += (h2 - 0.5) * burst * 0.25;
   vec3 pos = home + off;
 
   // narration FX: charge (gather + glow), discharge (burst), pulse (glow all)
@@ -194,6 +203,7 @@ void main(){
     else if (uFxMode == 3) { vGlow = uFxAmt*1.1; }
   }
 
+  pos *= uModelScale;                       // LLM can shrink/grow the whole model
   vec4 cam = uView * vec4(pos,1.0);
   if (cam.z >= -0.05) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; } // behind camera
   vec4 clip = uProj * cam;
@@ -223,7 +233,8 @@ void main(){
 
   // colors EMERGE as the form settles (soft glow while scattered -> true color)
   vColor = mix(vec3(0.78, 0.86, 1.0), color, smoothstep(0.15, 0.92, e));
-  vOpacity = opacity; vQuad = aCorner;
+  vOpacity = opacity * mix(0.5, 1.0, e);   // scattered particles dimmer -> calmer transition
+  vQuad = aCorner;
   vec2 ndc = clip.xy / clip.w;
   vec2 offset = (aCorner.x*major + aCorner.y*minor) * 2.0 / uViewport;
   gl_Position = vec4(ndc + offset, clip.z/clip.w, 1.0);
@@ -251,7 +262,7 @@ if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(pro
 gl.useProgram(prog);
 
 const U = {};
-["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
 // quad corners (triangle strip) + per-instance index buffer
 const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -284,12 +295,46 @@ const fx = { mode:0, center:[0,0,0], amt:0, t0:0, dur:0, kind:0 };
 function setFx(kind, center, ms){ fx.kind=kind; fx.mode=kind; fx.center=center||[0,0,0]; fx.t0=performance.now(); fx.dur=ms||1000; }
 const cam = { active:false, fy:0,fp:0,fd:0, ty:0,tp:0,td:0, t0:0, dur:1000 };
 function camTo(y,p,d,ms){ cam.active=true; cam.fy=yaw; cam.fp=pitch; cam.fd=dist; cam.ty=y; cam.tp=p; cam.td=d; cam.t0=performance.now(); cam.dur=ms||1200; }
+// model scale (LLM can shrink/grow) — animated
+let modelScale=1; const ms={active:false,f:1,t:1,t0:0,dur:800};
+function scaleTo(s,dur){ ms.active=true; ms.f=modelScale; ms.t=s; ms.t0=performance.now(); ms.dur=dur||800; }
+// 3D overlays: arrows + labels that float in space (LLM "허공에 화살표 / 라벨")
+const overlays=[]; const ovEl=document.getElementById("ov"), ovSvg=document.getElementById("ovsvg");
+function project(p, proj, view){
+  const x=p[0]*modelScale, y=p[1]*modelScale, z=p[2]*modelScale;
+  const cx=view[0]*x+view[4]*y+view[8]*z+view[12], cy=view[1]*x+view[5]*y+view[9]*z+view[13],
+        cz=view[2]*x+view[6]*y+view[10]*z+view[14], cw=view[3]*x+view[7]*y+view[11]*z+view[15];
+  const X=proj[0]*cx+proj[4]*cy+proj[8]*cz+proj[12], Y=proj[1]*cx+proj[5]*cy+proj[9]*cz+proj[13],
+        W=proj[3]*cx+proj[7]*cy+proj[11]*cz+proj[15];
+  if(W<=0) return {vis:false};
+  const c=document.getElementById("gl"), vw=c.clientWidth||c.width, vh=c.clientHeight||c.height;
+  return {vis:true, x:(X/W*0.5+0.5)*vw, y:(0.5-Y/W*0.5)*vh};
+}
+function addArrow(from,to,ms2){ const line=document.createElementNS("http://www.w3.org/2000/svg","line");
+  line.setAttribute("stroke","#39e6c6"); line.setAttribute("stroke-width","2.5"); line.setAttribute("marker-end","url(#arrow)");
+  line.setAttribute("opacity","0"); ovSvg.appendChild(line);
+  overlays.push({kind:"arrow", from, to, el:line, born:performance.now(), ttl:ms2||3000}); }
+function addLabel(at,text,ms2){ const d=document.createElement("div"); d.textContent=text;
+  d.style.cssText="position:absolute;transform:translate(-50%,-130%);background:#0a0e16d0;border:1px solid #39e6c6;color:#cfe6ff;font-size:12px;padding:3px 8px;border-radius:8px;white-space:nowrap;opacity:0;transition:opacity .3s";
+  ovEl.appendChild(d); overlays.push({kind:"label", at, el:d, born:performance.now(), ttl:ms2||3500}); }
+function clearOverlays(){ overlays.forEach(o=>o.el.remove()); overlays.length=0; }
+function updateOverlays(proj, view){
+  const now=performance.now();
+  for(let i=overlays.length-1;i>=0;i--){ const o=overlays[i];
+    const age=now-o.born, fade=Math.min(1,age/300)*Math.max(0,Math.min(1,(o.ttl-age)/400));
+    if(age>o.ttl){ o.el.remove(); overlays.splice(i,1); continue; }
+    if(o.kind==="arrow"){ const a=project(o.from,proj,view), b=project(o.to,proj,view);
+      if(a.vis&&b.vis){ o.el.setAttribute("x1",a.x);o.el.setAttribute("y1",a.y);o.el.setAttribute("x2",b.x);o.el.setAttribute("y2",b.y);o.el.setAttribute("opacity",fade);} else o.el.setAttribute("opacity",0); }
+    else { const p=project(o.at,proj,view); if(p.vis){ o.el.style.left=p.x+"px"; o.el.style.top=p.y+"px"; o.el.style.opacity=fade; } else o.el.style.opacity=0; }
+  }
+}
 const anim = { t:1, mode:"idle", from:1, to:1, t0:0, dur:1400, next:null };
 function tween(to,dur=1400,next=null){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; anim.next=next; }
 // inter-model transition: explode the CURRENT model into particles and keep it
 // swirling while the next model generates; loadCartridge() then assembles the new one.
 let _baseDist=null;
-function disassemble(){ if(COUNT){ _baseDist=dist; camTo(yaw, pitch, Math.min(dist*1.35, 8.5), 800); tween(0, 800, "scatter"); } }
+function disassemble(){ if(typeof clearOverlays==="function"){ clearOverlays(); scaleTo(1,400); }
+  if(COUNT){ _baseDist=dist; camTo(yaw, pitch, Math.min(dist*1.35, 8.5), 800); tween(0, 800, "scatter"); } }
 
 function resize(){
   const dpr=Math.min(devicePixelRatio||1,2);
@@ -384,6 +429,8 @@ function frame(){
   if(cam.active){ const k=Math.min(1,(now-cam.t0)/cam.dur), e=k*k*(3-2*k);
     yaw=cam.fy+(cam.ty-cam.fy)*e; pitch=cam.fp+(cam.tp-cam.fp)*e; dist=cam.fd+(cam.td-cam.fd)*e;
     if(k>=1) cam.active=false; }
+  if(ms.active){ const k=Math.min(1,(now-ms.t0)/ms.dur), e=k*k*(3-2*k);
+    modelScale=ms.f+(ms.t-ms.f)*e; if(k>=1) ms.active=false; }
 
   resize();
   gl.viewport(0,0,canvas.width,canvas.height);
@@ -407,7 +454,9 @@ function frame(){
     gl.uniform2f(U.uFocal, proj[0]*0.5*canvas.width, proj[5]*0.5*canvas.height);
     gl.uniform2f(U.uViewport, canvas.width, canvas.height);
     gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale); gl.uniform1f(U.uTime, now*0.001);
+    gl.uniform1f(U.uModelScale, modelScale);
     gl.uniform1i(U.uFxMode, fx.mode); gl.uniform3fv(U.uFxCenter, fx.center); gl.uniform1f(U.uFxAmt, fx.amt);
+    updateOverlays(proj, view);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
   }
   frames++;
@@ -523,14 +572,19 @@ function speak(text){ return new Promise(res=>{
 function runAction(a){
   if(!a||!a.type) return;
   if(a.type==="focus") camTo(a.yaw??yaw, a.pitch??pitch, a.dist??dist, a.ms??1200);
-  else if(a.type==="spin"){ autospin=true; setTimeout(()=>autospin=false, a.ms??1500); }
+  else if(a.type==="spin"||a.type==="orbit"){ autospin=true; setTimeout(()=>autospin=false, a.ms??1500); }
   else if(a.type==="charge") setFx(1, a.center, a.ms??1500);
   else if(a.type==="discharge") setFx(2, a.center, a.ms??700);
   else if(a.type==="pulse") setFx(3, [0,0,0], a.ms??600);
+  else if(a.type==="scale") scaleTo(a.to??0.6, a.ms??900);
+  else if(a.type==="arrow"&&a.from&&a.to) addArrow(a.from, a.to, a.ms??3000);
+  else if(a.type==="label"&&a.at&&a.text) addLabel(a.at, a.text, a.ms??3500);
 }
 async function playScript(steps){
+  clearOverlays(); scaleTo(1,1);
   for(const s of (steps||[])){ runAction(s.action); add("act","🔊 "+(s.say||"")); await speak(s.say); }
-  fx.mode=0; fx.amt=0; autospin=false;
+  await new Promise(r=>setTimeout(r,1200));
+  fx.mode=0; fx.amt=0; autospin=false; scaleTo(1,800); clearOverlays();
 }
 const narrBtn=document.getElementById("narr");
 async function narrate(text){
