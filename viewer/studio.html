@@ -129,7 +129,8 @@
       <input id="file" type="file" accept="image/*" style="display:none" /></div>
     <form id="chat">
       <select id="model" class="ctl"><option value="heuristic">heuristic (no LLM)</option></select>
-      <input id="msg" placeholder="describe a hologram…" autocomplete="off" />
+      <input id="msg" placeholder="describe a hologram, or a topic to narrate…" autocomplete="off" />
+      <button id="narr" class="ctl" type="button" title="narrate: speak + manipulate the model">🎙</button>
       <button id="send" type="submit">Send</button>
     </form>
     <div class="note">No raw 3D buffers go to the LLM — only SGF summaries + a cartridge
@@ -154,7 +155,8 @@ layout(location=1) in uint aIndex;       // sorted splat index (back-to-front)
 uniform sampler2D uData; uniform int uTexW;
 uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
 uniform float uT, uSizeScale;
-out vec3 vColor; out float vOpacity; out vec2 vQuad;
+uniform int uFxMode; uniform vec3 uFxCenter; uniform float uFxAmt;  // narration FX
+out vec3 vColor; out float vOpacity; out vec2 vQuad; out float vGlow;
 
 vec4 texel(int p){ return texelFetch(uData, ivec2(p % uTexW, p / uTexW), 0); }
 vec3 hash3(vec3 p){ p = fract(p*vec3(443.897,441.423,437.195)); p += dot(p, p.yzx+19.19); return fract((p.xxy+p.yzz)*p.zyx); }
@@ -172,6 +174,16 @@ void main(){
   vec3 pos = mix(scatter, home, e);
   float ang = (1.0-e)*2.6; float ca = cos(ang), sa = sin(ang);
   pos.xz = mat2(ca,-sa,sa,ca) * pos.xz;
+
+  // narration FX: charge (gather + glow), discharge (burst), pulse (glow all)
+  vGlow = 0.0;
+  if (uFxMode > 0) {
+    float dd = distance(home, uFxCenter);
+    float infl = exp(-dd*dd*7.0);
+    if (uFxMode == 1) { pos += (uFxCenter - pos)*uFxAmt*0.45*infl; vGlow = uFxAmt*infl*2.2; }
+    else if (uFxMode == 2) { pos += normalize(home - uFxCenter + vec3(1e-4))*uFxAmt*0.7*infl; vGlow = uFxAmt*infl*3.2; }
+    else if (uFxMode == 3) { vGlow = uFxAmt*1.1; }
+  }
 
   vec4 cam = uView * vec4(pos,1.0);
   if (cam.z >= -0.05) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; } // behind camera
@@ -208,13 +220,14 @@ void main(){
 
 const FRAG = `#version 300 es
 precision highp float;
-in vec3 vColor; in float vOpacity; in vec2 vQuad; out vec4 frag;
+in vec3 vColor; in float vOpacity; in vec2 vQuad; in float vGlow; out vec4 frag;
 void main(){
   float r2 = dot(vQuad, vQuad);          // {-1,1} quad; ellipse at r2<=1 (3 sigma)
   if (r2 > 1.0) discard;
   float alpha = vOpacity * exp(-4.5 * r2);   // gaussian falloff (corner=3 sigma)
   if (alpha < 0.004) discard;
-  frag = vec4(vColor * alpha, alpha);        // premultiplied -> over-blend
+  vec3 col = vColor + vGlow * vec3(0.9, 0.95, 0.35);   // electric glow tint
+  frag = vec4(col * alpha, alpha);        // premultiplied -> over-blend
 }`;
 
 function compile(t,s){ const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh);
@@ -227,7 +240,7 @@ if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(pro
 gl.useProgram(prog);
 
 const U = {};
-["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
 // quad corners (triangle strip) + per-instance index buffer
 const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -255,6 +268,11 @@ const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l
 
 // ============================================================= camera =======
 let yaw=0.7, pitch=0.4, dist=3.4, target=[0,0,0], sizeScale=1.0, autospin=false;
+// narration FX state (charge/discharge/pulse) + smooth camera moves
+const fx = { mode:0, center:[0,0,0], amt:0, t0:0, dur:0, kind:0 };
+function setFx(kind, center, ms){ fx.kind=kind; fx.mode=kind; fx.center=center||[0,0,0]; fx.t0=performance.now(); fx.dur=ms||1000; }
+const cam = { active:false, fy:0,fp:0,fd:0, ty:0,tp:0,td:0, t0:0, dur:1000 };
+function camTo(y,p,d,ms){ cam.active=true; cam.fy=yaw; cam.fp=pitch; cam.fd=dist; cam.ty=y; cam.tp=p; cam.td=d; cam.t0=performance.now(); cam.dur=ms||1200; }
 const anim = { t:1, mode:"idle", from:1, to:1, t0:0, dur:1400, next:null };
 function tween(to,dur=1400,next=null){ anim.mode="tween"; anim.from=anim.t; anim.to=to; anim.t0=performance.now(); anim.dur=dur; anim.next=next; }
 // inter-model transition: explode the CURRENT model into particles and keep it
@@ -343,6 +361,18 @@ function frame(){
   else if(anim.mode==="cycle"){ const P=1400+1000+1400+700, x=(now-anim.t0)%P;
     anim.t = x<1400 ? x/1400 : x<2400 ? 1 : x<3800 ? 1-(x-2400)/1400 : 0; }
 
+  // FX envelope: charge ramps up & holds, discharge spikes then decays, pulse breathes
+  if(fx.mode>0){ const k=Math.min(1,(now-fx.t0)/fx.dur);
+    if(fx.kind===1) fx.amt = k;                                  // charge: build
+    else if(fx.kind===2) fx.amt = Math.max(0,(1-k))*(0.4+1.6*Math.exp(-k*4.0)); // discharge: spike+decay
+    else if(fx.kind===3) fx.amt = 0.5+0.5*Math.sin(now*0.012);   // pulse
+    if(k>=1 && fx.kind===2){ fx.mode=0; fx.amt=0; }              // discharge ends -> off
+  }
+  // smooth camera move
+  if(cam.active){ const k=Math.min(1,(now-cam.t0)/cam.dur), e=k*k*(3-2*k);
+    yaw=cam.fy+(cam.ty-cam.fy)*e; pitch=cam.fp+(cam.tp-cam.fp)*e; dist=cam.fd+(cam.td-cam.fd)*e;
+    if(k>=1) cam.active=false; }
+
   resize();
   gl.viewport(0,0,canvas.width,canvas.height);
   gl.clearColor(0.012,0.025,0.05,1); gl.clear(gl.COLOR_BUFFER_BIT);
@@ -365,6 +395,7 @@ function frame(){
     gl.uniform2f(U.uFocal, proj[0]*0.5*canvas.width, proj[5]*0.5*canvas.height);
     gl.uniform2f(U.uViewport, canvas.width, canvas.height);
     gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale);
+    gl.uniform1i(U.uFxMode, fx.mode); gl.uniform3fv(U.uFxCenter, fx.center); gl.uniform1f(U.uFxAmt, fx.amt);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
   }
   frames++;
@@ -445,6 +476,44 @@ async function sendMsg(text){
 }
 document.getElementById("chat").addEventListener("submit", e=>{ e.preventDefault(); sendMsg(input.value); });
 document.querySelectorAll(".quick .ctl").forEach(b=>b.onclick=()=>sendMsg(b.dataset.q));
+
+// ============================================================= narration ====
+// JARVIS mode: build the model, then speak (TTS) while firing synced visual cues.
+function speak(text){ return new Promise(res=>{
+  if(!text || !window.speechSynthesis){ setTimeout(res, Math.max(500, (text||"").length*70)); return; }
+  try{ const u=new SpeechSynthesisUtterance(text); u.lang=(/[가-힣]/.test(text))?"ko-KR":"en-US"; u.rate=1.0; u.pitch=1.0;
+    u.onend=res; u.onerror=res; speechSynthesis.cancel(); speechSynthesis.speak(u);
+  }catch(e){ setTimeout(res, 900); } }); }
+function runAction(a){
+  if(!a||!a.type) return;
+  if(a.type==="focus") camTo(a.yaw??yaw, a.pitch??pitch, a.dist??dist, a.ms??1200);
+  else if(a.type==="spin"){ autospin=true; setTimeout(()=>autospin=false, a.ms??1500); }
+  else if(a.type==="charge") setFx(1, a.center, a.ms??1500);
+  else if(a.type==="discharge") setFx(2, a.center, a.ms??700);
+  else if(a.type==="pulse") setFx(3, [0,0,0], a.ms??600);
+}
+async function playScript(steps){
+  for(const s of (steps||[])){ runAction(s.action); add("act","🔊 "+(s.say||"")); await speak(s.say); }
+  fx.mode=0; fx.amt=0; autospin=false;
+}
+const narrBtn=document.getElementById("narr");
+async function narrate(text){
+  if(!text.trim()) return;
+  add("me", "🎙 "+text.replace(/</g,"&lt;")); input.value=""; narrBtn.disabled=send.disabled=true; setState("…");
+  disassemble();
+  const model=document.getElementById("model").value;
+  try{
+    const r=await fetch(`${API}/v1/narrate`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({prompt:text, topic:text, model:model==="heuristic"?null:model, lang:(/[가-힣]/.test(text))?"ko":"en"})});
+    const d=await r.json();
+    add("bot",`<span class="eng">${d.engine} · director ${d.director}</span><br>built “${d.name}”, narrating ${d.script.length} steps…`);
+    setState("DISPLAYED"); setSgf(d.sgf,0); await loadCartridge(true);
+    await new Promise(r=>setTimeout(r,1400));   // let it assemble first
+    await playScript(d.script);
+  }catch(e){ add("bot",`<span class="eng">error</span><br>${e}`); setState("ERROR"); }
+  finally{ narrBtn.disabled=send.disabled=false; }
+}
+narrBtn.onclick=()=>narrate(input.value);
 
 // ============================================================= rating =======
 let lastGen=null;

@@ -645,6 +645,111 @@ async def generate_from_image(image: UploadFile = File(...)) -> Dict[str, Any]:
     return resp
 
 
+# --------------------------------------------------------------------------- #
+# Object generation helper (picks the best enabled generator) + JARVIS narrate.
+# --------------------------------------------------------------------------- #
+def _gen_object(prompt: str):
+    """(field, tag) for a text prompt using the best available generator."""
+    if _USE_TRIPOSR:
+        return _triposr().generate(prompt), "triposr→3d"
+    if _USE_MV:
+        return _mv().generate(prompt), "multiview→3d"
+    if _USE_SD:
+        return _sd().generate(prompt), "tiny-sd→3d"
+    shape = detect_shape(prompt)
+    return _engine.generator.generate(_prompt_to_mv(prompt), cam_rays={"shape": shape}), shape
+
+
+class NarrateRequest(BaseModel):
+    prompt: str                      # the subject to build, e.g. "pikachu"
+    topic: Optional[str] = None      # the explanation; defaults to prompt
+    model: Optional[str] = None      # ollama model for the director (None -> heuristic)
+    lang: str = "ko"
+
+
+@app.post("/v1/narrate")
+def narrate(req: NarrateRequest) -> Dict[str, Any]:
+    """Build the model, then return a time-synced narration script (say+action)
+    the browser plays with TTS while manipulating the particles (JARVIS mode)."""
+    from atanor_core.llm.director import make_script
+
+    name = _slug(req.prompt)
+    field, tag = _gen_object(req.prompt)
+    _display_field(name, field)
+    d = make_script(req.topic or req.prompt, lang=req.lang, ollama_model=req.model)
+    return {"name": name, "engine": tag, "director": d["engine"],
+            "script": d["script"], "sgf": _sgf_summary(field)}
+
+
+# --------------------------------------------------------------------------- #
+# Multi-object scene (Phase 1) — objects placed in shared space, flattened to
+# one field the existing viewer renders. See docs/REALTIME_EXPLAINER.md.
+# --------------------------------------------------------------------------- #
+from atanor_core.domain.scene import Scene, SceneObject  # noqa: E402
+
+_scene = Scene()
+
+
+def _scene_display():
+    """Flatten the scene into the engine field so /v1/cartridge serves it."""
+    _engine.field = _scene.flatten()
+    _engine.deformer = FourierDeformer(_engine.field.means)
+    _engine._edges = []
+    _engine.state = HoloState.DISPLAYED
+
+
+class SpawnRequest(BaseModel):
+    prompt: str
+    id: Optional[str] = None
+    position: Optional[List[float]] = None
+    scale: float = 1.0
+    label: Optional[str] = None
+
+
+class MoveRequest(BaseModel):
+    id: str
+    position: List[float]
+
+
+@app.post("/v1/scene/spawn")
+def scene_spawn(req: SpawnRequest) -> Dict[str, Any]:
+    field, tag = _gen_object(req.prompt)
+    oid = req.id or _slug(req.prompt) or f"obj{len(_scene.objects)}"
+    pos = np.array(req.position, np.float32) if req.position else None
+    _scene.add(SceneObject(id=oid, field=field,
+                           position=pos if pos is not None else np.zeros(3, np.float32),
+                           scale=float(req.scale), label=req.label))
+    if req.position is None:
+        _scene.auto_layout()
+    _scene_display()
+    return {"ok": True, "id": oid, "engine": tag, "objects": list(_scene.objects),
+            "sgf": _sgf_summary(_engine.field)}
+
+
+@app.post("/v1/scene/move")
+def scene_move(req: MoveRequest) -> Dict[str, Any]:
+    if req.id not in _scene.objects:
+        raise HTTPException(404, "no such object")
+    _scene.move(req.id, req.position); _scene_display()
+    return {"ok": True, "sgf": _sgf_summary(_engine.field)}
+
+
+@app.post("/v1/scene/clear")
+def scene_clear() -> Dict[str, Any]:
+    _scene.objects.clear(); _scene.links.clear(); _scene.version += 1
+    return {"ok": True}
+
+
+@app.get("/v1/scene")
+def scene_list() -> Dict[str, Any]:
+    return {"version": _scene.version,
+            "objects": [{"id": o.id, "position": o.position.tolist(),
+                         "scale": o.scale, "label": o.label,
+                         "num_gaussians": o.field.num_gaussians}
+                        for o in _scene.objects.values()],
+            "links": [{"src": s, "dst": d} for s, d, _ in _scene.links]}
+
+
 @app.get("/v1/frame")
 def frame(
     yaw: float = 0.6,
