@@ -1,0 +1,14 @@
+src
+apps
+tests
+scripts
+rust
+out
+viewer
+.github
+.claude
+*.md
+*.toml
+*.cfg
+*.sh
+.gitignore
