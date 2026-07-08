@@ -141,6 +141,26 @@ def _rodrigues(v: np.ndarray, axis: np.ndarray, ang: np.ndarray) -> np.ndarray:
             + axis * np.einsum("nd,nd->n", axis, v)[:, None] * (1 - ca))
 
 
+def decompose_chains(rig: JointRig) -> list[list[int]]:
+    """Partition ALL joints into kinematic chains by outward-direction grouping
+    (joints pointing the same way off the body form one limb/tail/branch),
+    each ordered root->tip by distance from the centroid. Every joint lands in
+    exactly one chain; isolated joints become 1-chains. Works for ANY generated
+    shape — nothing is assumed about the creature."""
+    J = len(rig.joints)
+    d = np.linalg.norm(rig.joints - rig.centroid, axis=1)
+    unassigned = set(range(J))
+    chains = []
+    while unassigned:
+        seed = max(unassigned, key=lambda j: d[j])
+        grp = [j for j in unassigned
+               if float(rig.outward[j] @ rig.outward[seed]) > 0.6]
+        grp.sort(key=lambda j: d[j])
+        chains.append(grp)
+        unassigned -= set(grp)
+    return chains
+
+
 def pose_chain(points: np.ndarray, rig: JointRig, chain: list[int],
                drive: float, band: float | None = None) -> np.ndarray:
     """True forward kinematics along a joint CHAIN (e.g. a tail or a limb).
