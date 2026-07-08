@@ -66,9 +66,17 @@ def build_ato(n_points: int = 70000, seed: int = 7):
 
     u = n_points // 100           # budget unit (percent)
 
-    # ── clock body: fat orange disk facing +z ────────────────────────────────
+    # ── clock body: fat orange disk facing +z. TWO layers — surface shell +
+    # inner fill — so the body reads SOLID, not gauzy ─────────────────────────
     body_r = 1.0
-    add(*_disk(rng, [0, 0.35, 0], body_r, 0.22, 34 * u, ORANGE), 0.030)
+    add(*_disk(rng, [0, 0.35, 0], body_r, 0.22, 30 * u, ORANGE), 0.036)
+    inner = rng.normal(size=(12 * u, 3))
+    inner /= np.linalg.norm(inner, axis=1, keepdims=True) + 1e-9
+    inner *= rng.uniform(0, 1, (12 * u, 1)) ** 0.5     # bias toward the surface
+    inner[:, 0] *= body_r * 0.94
+    inner[:, 1] *= body_r * 0.94
+    inner[:, 2] *= 0.18
+    add(inner + [0, 0.35, 0], np.tile(ORANGE, (12 * u, 1)), 0.040)
     # face rim — WARM brown, deliberately low-contrast against the orange so
     # the rim arc never out-scores the pupils in the eye detector
     ang = rng.uniform(0, 2 * np.pi, 6 * u)
@@ -96,12 +104,14 @@ def build_ato(n_points: int = 70000, seed: int = 7):
         add(*_tube(rng, pin, pin + d * ln, 0.030, u, DARK, taper=0.5), 0.015)
     add(*_ball(rng, pin + [0, 0, 0.01], 0.05, u, DARK), 0.015)   # centre pin
 
-    # ── eyes: big cream ovals + dark pupils + lashes ────────────────────────
+    # ── eyes: big cream ovals + round pupils + CATCHLIGHT (the life dot) ─────
     for sx in (-1, 1):
         ec = np.array([0.34 * sx, 0.62, 0.24])
-        add(*_ball(rng, ec, 0.21, 5 * u, CREAM, squash=(0.75, 1.0, 0.18)), 0.022)
-        add(*_ball(rng, ec + [0.02 * sx, -0.03, 0.05], 0.10, 3 * u, DARK,
-                   squash=(0.75, 1.0, 0.25)), 0.018)
+        add(*_ball(rng, ec, 0.21, 5 * u, CREAM, squash=(0.78, 1.0, 0.16)), 0.024)
+        pc = ec + [0.015 * sx, -0.02, 0.06]
+        add(*_ball(rng, pc, 0.115, 3 * u, DARK, squash=(0.85, 1.0, 0.28)), 0.020)
+        add(*_ball(rng, pc + [-0.035 * sx, 0.045, 0.05], 0.032, u, (1.0, 1.0, 1.0)),
+            0.020)                                               # catchlight
         for lk in (-1, 0, 1):                                     # lashes
             base = ec + [0.10 * sx * (0.6 + 0.3 * abs(lk)), 0.19, 0.0]
             tip = base + [0.07 * sx * lk * 0.5 + 0.04 * sx, 0.10, 0.0]
@@ -109,11 +119,11 @@ def build_ato(n_points: int = 70000, seed: int = 7):
 
     # ── smile: a ∪ arc — LOWEST in the middle (the sign the frown version
     # got wrong), sitting under the hands ────────────────────────────────────
-    a = rng.uniform(-0.62, 0.62, 2 * u)
+    a = rng.uniform(-0.62, 0.62, 3 * u)
     smile = np.stack([a * 0.55, -0.28 + 0.30 * (a ** 2),
-                      np.full(2 * u, 0.235)], axis=1)
-    smile += rng.normal(scale=0.010, size=smile.shape)
-    add(smile, np.tile(DARK, (2 * u, 1)), 0.015)
+                      np.full(3 * u, 0.235)], axis=1)
+    smile += rng.normal(scale=0.012, size=smile.shape)
+    add(smile, np.tile(DARK, (3 * u, 1)), 0.019)
 
     # ── arms: shoulder -> elbow -> glove (two segments = an FK chain) ───────
     for sx in (-1, 1):
@@ -154,5 +164,5 @@ def build_ato(n_points: int = 70000, seed: int = 7):
     n = len(pos)
     scale = np.repeat(sizes[:, None], 3, axis=1)
     quat = np.zeros((n, 4), np.float32); quat[:, 0] = 1.0
-    opa = np.full(n, 0.92, np.float32)
+    opa = np.full(n, 0.985, np.float32)              # solid, not gauzy
     return pos, col, scale.astype(np.float32), quat, opa
