@@ -108,20 +108,35 @@ class RigPredictor:
         self.net.eval()
         return float(loss.item())
 
+    def save(self, path: str) -> None:
+        torch.save({"net": self.net.state_dict(), "mu": self.mu, "sd": self.sd}, path)
+
+    @classmethod
+    def load(cls, path: str) -> "RigPredictor":
+        rp = cls()
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        rp.net.load_state_dict(blob["net"])
+        rp.net.eval()
+        rp.mu, rp.sd = blob["mu"], blob["sd"]
+        return rp
+
     def jointness(self, points: np.ndarray) -> np.ndarray:
         with torch.no_grad():
             f = torch.tensor(self._norm(features(points)))
             return self.net(f.to(next(self.net.parameters()).device)).cpu().numpy()
 
-    def predict_joints(self, points: np.ndarray, thresh: float = 0.4,
+    def predict_joints(self, points: np.ndarray, floor: float = 0.15,
                        rel: float = 0.5, merge: float = 0.12,
                        max_joints: int = 20) -> np.ndarray:
         """High-jointness points -> joint centres via greedy weighted mean-shift.
-        Cut is adaptive: max(abs thresh, rel*peak) so it survives under-confident nets."""
+        Cut adapts to the net's confidence on THIS shape — rel*peak — with a small
+        absolute floor so pure noise (peak~0) still yields nothing. A hard high
+        threshold would return zero joints on any off-distribution shape where
+        the net is under-confident but still correctly ranked."""
         P = np.asarray(points, dtype=np.float32)
         Pc = (P - P.mean(0)); Pc /= (np.abs(Pc).max() + 1e-6)
         j = self.jointness(P)
-        cut = max(thresh, rel * float(j.max()))
+        cut = max(floor, rel * float(j.max()))
         hot, wj = Pc[j > cut], j[j > cut]
         joints, used = [], np.zeros(len(hot), bool)
         for idx in np.argsort(-wj):

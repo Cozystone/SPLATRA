@@ -26,7 +26,7 @@ def test_make_creature_has_internal_joints():
 def test_features_shape_and_finite():
     s = make_creature(np.random.default_rng(2), 600)
     f = features(s["points"])
-    assert f.shape == (600, 10)
+    assert f.shape == (len(s["points"]), 10)
     assert np.isfinite(f).all()
 
 
