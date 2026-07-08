@@ -83,8 +83,12 @@ def find_eyes(points: np.ndarray, colors: np.ndarray, n_sub: int = 6000,
         else:
             w1, w2 = home["mass"], cl["mass"]
             home["centre"] = (home["centre"] * w1 + cl["centre"] * w2) / (w1 + w2)
-            home["radius"] = max(home["radius"],
-                                 float(np.linalg.norm(home["centre"] - cl["centre"]) + cl["radius"]))
+            # grow gently, not to full cover: chained merges of one eye's pieces
+            # (white + pupil + lash) otherwise inflate past the size cap and the
+            # eye rejects itself. The blink shader smoothsteps past the radius
+            # anyway, so a slight under-cover is harmless.
+            d = float(np.linalg.norm(home["centre"] - cl["centre"]))
+            home["radius"] = max(home["radius"], 0.6 * d + 0.75 * cl["radius"])
             home["mass"] = w1 + w2
 
     # 3) eye plausibility: small, elevated, not the global centre
@@ -96,22 +100,31 @@ def find_eyes(points: np.ndarray, colors: np.ndarray, n_sub: int = 6000,
             continue
         eyes.append(cl)
     eyes.sort(key=lambda e: -e["mass"])
-    eyes = eyes[:max_eyes]
 
-    # prefer a left/right PAIR when present (mirrored across the x or z axis)
-    if len(eyes) > 2:
-        best = None
-        for i in range(len(eyes)):
-            for j in range(i + 1, len(eyes)):
-                a, b = eyes[i]["centre"], eyes[j]["centre"]
-                for ax in (0, 2):
-                    mirror = abs(a[ax] + b[ax]) < 0.12 and abs(a[1] - b[1]) < 0.10
-                    if mirror:
-                        score = eyes[i]["mass"] + eyes[j]["mass"]
-                        if best is None or score > best[0]:
-                            best = (score, i, j)
-        if best:
-            eyes = [eyes[best[1]], eyes[best[2]]]
+    # prefer a left/right PAIR (mirrored across the x or z axis) — searched over
+    # ALL plausible clusters BEFORE truncation: real eyes are often out-massed
+    # by decorative contrast (rims, stripes), but decorations don't come in
+    # mirrored pairs of similar size; eyes do.
+    best = None
+    y_upper = float(np.quantile(P[:, 1], 0.5))     # eyes live in the upper body
+    for i in range(len(eyes)):
+        for j in range(i + 1, len(eyes)):
+            a, b = eyes[i]["centre"], eyes[j]["centre"]
+            if (a[1] + b[1]) * 0.5 < y_upper:      # a low pair is decoration
+                continue
+            similar = (min(eyes[i]["radius"], eyes[j]["radius"])
+                       / max(eyes[i]["radius"], eyes[j]["radius"])) > 0.5
+            for ax in (0, 2):
+                mirror = (abs(a[ax] + b[ax]) < 0.12 and abs(a[1] - b[1]) < 0.10
+                          and abs(a[ax]) > 0.05 and similar)
+                if mirror:
+                    score = eyes[i]["mass"] + eyes[j]["mass"]
+                    if best is None or score > best[0]:
+                        best = (score, i, j)
+    if best:
+        eyes = [eyes[best[1]], eyes[best[2]]]
+    else:
+        eyes = eyes[:max_eyes]
 
     return [{"center": (np.asarray(e["centre"]) * s + c).tolist(),
              "radius": float(e["radius"] * s),
