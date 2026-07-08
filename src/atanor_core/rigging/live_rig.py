@@ -37,16 +37,52 @@ def load_spl2(path: str):
 
 
 def predict_rig_joints(points: np.ndarray, predictor: RigPredictor,
-                       n_sub: int = 1200, seed: int = 0) -> np.ndarray:
+                       n_sub: int = 1200, seed: int = 0, ensemble: int = 5,
+                       merge: float = 0.12, min_votes: int = 2) -> np.ndarray:
     """Predict joint positions for a full particle cloud, returned in the CLOUD's
-    original coordinate frame (the predictor works canonically)."""
+    original coordinate frame (the predictor works canonically).
+
+    A single random subsample is UNSTABLE (the confidence peak — and with it the
+    adaptive cut — swings with the draw). And a raw score cut cannot separate a
+    weak-but-real joint region from body noise (their SCORES overlap; what
+    differs is that a real joint is a CLUSTER that recurs in every subsample).
+    So: pool hot points from several subsamples with a low cut, mean-shift the
+    union, then rank clusters by vote count (how many subsamples contributed)
+    and mass — recurring clusters survive, one-draw noise dies. The RNG is
+    seeded from the cloud itself, so the same field always yields the same rig."""
     P = np.asarray(points, dtype=np.float32)
     c = P.mean(0)
     s = np.abs(P - c).max() + 1e-6
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(P), size=min(n_sub, len(P)), replace=False)
-    sub = (P[idx] - c) / s
-    joints = predictor.predict_joints(sub)
+    base = int(np.abs(P[:64]).sum() * 1e3) % (2 ** 31)     # deterministic per field
+    rng = np.random.default_rng(base + seed)
+    ensemble = max(1, ensemble)
+    hot, wj, vote = [], [], []
+    for e in range(ensemble):
+        idx = rng.choice(len(P), size=min(n_sub, len(P)), replace=False)
+        sub = (P[idx] - c) / s
+        j = predictor.jointness(sub)
+        cut = max(0.12, 0.35 * float(j.max()))
+        sel = j > cut
+        hot.append(sub[sel]); wj.append(j[sel]); vote.append(np.full(sel.sum(), e))
+    hot = np.concatenate(hot); wj = np.concatenate(wj); vote = np.concatenate(vote)
+    if len(hot) == 0:
+        return np.zeros((0, 3), np.float32)
+    clusters = []
+    used = np.zeros(len(hot), bool)
+    for idx in np.argsort(-wj):
+        if used[idx]:
+            continue
+        grp = np.linalg.norm(hot - hot[idx], axis=1) < merge
+        used |= grp
+        clusters.append((np.average(hot[grp], axis=0, weights=wj[grp]),
+                         float(wj[grp].sum()), len(np.unique(vote[grp]))))
+    if not clusters:
+        return np.zeros((0, 3), np.float32)
+    top_mass = max(m for _, m, _ in clusters)
+    need_votes = max(min_votes, int(np.ceil(ensemble * 0.6)))
+    joints = [cen for cen, mass, votes in clusters
+              if votes >= min(need_votes, ensemble) and mass >= 0.15 * top_mass]
+    joints = np.asarray(joints[:16], np.float32).reshape(-1, 3)
     return joints * s + c if len(joints) else joints
 
 
