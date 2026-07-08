@@ -81,6 +81,7 @@
     <span class="pill" id="modelPill">ollama: …</span>
     <span class="pill" id="countPill">0 splats</span>
     <span class="pill" id="statePill">IDLE</span>
+    <span class="pill" id="buildPill" title="build version">build skel-v7</span>
   </div>
 </header>
 
@@ -96,7 +97,24 @@
       <button class="ctl" id="spin">▶ spin</button>
       <button class="ctl" id="reassemble">⟳ reassemble</button>
       <button class="ctl" id="cycle">∞ auto-cycle</button>
+      <button class="ctl" id="invert" title="flip drag direction">⇄ invert</button>
       <label class="slider">size <input id="sizeR" type="range" min="0.4" max="2.4" step="0.1" value="1.0"></label>
+    </div>
+    <div id="anim" style="position:absolute;left:8px;bottom:8px;display:flex;gap:4px;flex-wrap:wrap">
+      <span style="color:var(--muted);font-size:11px;align-self:center">animate:</span>
+      <button class="ctl anim" data-a="flow">🌀 flow</button>
+      <button class="ctl anim" data-a="rig">🦴 rig</button>
+      <button class="ctl anim" data-a="water">💧 water</button>
+      <button class="ctl anim" data-a="soil">🏜 soil</button>
+      <button class="ctl anim" data-a="breathe">🫁 breathe</button>
+      <button class="ctl anim" data-a="sway">🌿 sway</button>
+      <button class="ctl anim" data-a="bounce">⬆ bounce</button>
+      <button class="ctl anim" data-a="float">🎈 float</button>
+      <button class="ctl anim" data-a="jelly">🟦 jelly</button>
+      <button class="ctl anim" data-a="wave">🌊 wave</button>
+      <button class="ctl anim" data-a="walk">🚶 walk</button>
+      <button class="ctl anim" data-a="handwave">👋 wave hand</button>
+      <button class="ctl anim" data-a="stop">⏹ stop</button>
     </div>
     <div id="hint" class="overlay">drag = orbit · scroll = zoom · right/shift-drag = pan · real anisotropic 3DGS on your GPU</div>
     <div id="fps" class="overlay"></div>
@@ -146,7 +164,8 @@
 <script>
 // Backend base. Priority: ?api=… → same origin (local server) → auto-probe the
 // local GPU server (so opening the Vercel page ON the GPU PC just works).
-let API = new URLSearchParams(location.search).get("api");
+const QS = new URLSearchParams(location.search);
+let API = QS.get("api");
 if (!API) {
   const local = (location.hostname === "127.0.0.1" || location.hostname === "localhost");
   API = local ? location.origin : "http://127.0.0.1:8000";   // remote page -> try the local GPU box
@@ -165,11 +184,20 @@ uniform sampler2D uData; uniform int uTexW;
 uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
 uniform float uT, uSizeScale, uTime, uModelScale, uSwirl;
 uniform int uFxMode; uniform vec3 uFxCenter; uniform float uFxAmt;  // narration FX
+uniform int uAnimMode; uniform float uAnimT, uAnimAmp;              // procedural animation
+uniform float uRigHipY, uRigShoulderY, uRigCenterX;                // skeleton fitted to the model
+uniform int uNJ;                                                    // learned rig (mode 11)
+uniform vec3 uJPos[16]; uniform vec3 uJOut[16]; uniform float uJReach;
+uniform mat3 uJRot[16]; uniform vec3 uJTrans[16];   // per-joint FK rigid transform (built in JS)
+uniform int uNEye; uniform vec4 uEyes[4];           // semantic parts: eye spheres (xyz,r)
+uniform float uBlink;                               // 0 open .. 1 closed
+uniform float uFloorY;                              // model floor for material melt modes
 out vec3 vColor; out float vOpacity; out vec2 vQuad; out float vGlow;
 
 vec4 texel(int p){ return texelFetch(uData, ivec2(p % uTexW, p / uTexW), 0); }
 vec3 hash3(vec3 p){ p = fract(p*vec3(443.897,441.423,437.195)); p += dot(p, p.yzx+19.19); return fract((p.xxy+p.yzz)*p.zyx); }
 vec3 rotAxis(vec3 p, vec3 ax, float a){ float c=cos(a), s=sin(a); return p*c + cross(ax,p)*s + ax*dot(ax,p)*(1.0-c); }
+vec3 swing(vec3 p, vec3 pv, vec3 ax, float a){ return rotAxis(p - pv, ax, a) + pv; }  // limb rotate about a joint
 
 void main(){
   int base = int(aIndex)*4;
@@ -195,6 +223,136 @@ void main(){
     if (uFxMode == 1) { pos += (uFxCenter - pos)*uFxAmt*0.45*infl; vGlow = uFxAmt*infl*2.2; }
     else if (uFxMode == 2) { pos += normalize(home - uFxCenter + vec3(1e-4))*uFxAmt*0.7*infl; vGlow = uFxAmt*infl*3.2; }
     else if (uFxMode == 3) { vGlow = uFxAmt*1.1; }
+  }
+
+  // procedural deformation animation: canonical cloud -> time-warped pose. No
+  // training — hand-authored deformation fields driven by uAnimT (phase) so the
+  // generated model can breathe / sway / bounce / float / wobble / wave / spin.
+  if (uAnimMode > 0) {
+    float aA = uAnimAmp, ph = uAnimT;
+    if (uAnimMode == 1) {                    // breathe (inflate/deflate from center)
+      pos += home * (sin(ph) * 0.07 * aA);
+    } else if (uAnimMode == 2) {             // sway (bend, stronger higher up)
+      float up = clamp(home.y*0.5 + 0.5, 0.0, 1.0);
+      pos.x += sin(ph) * 0.30 * aA * up;
+      pos.z += cos(ph*0.9) * 0.12 * aA * up;
+    } else if (uAnimMode == 3) {             // bounce + squash
+      float b = abs(sin(ph));
+      pos.y += (b - 0.3) * 0.32 * aA;
+      float sq = mix(1.0, 0.82, (1.0 - b) * aA);
+      pos.y *= sq; pos.x /= sqrt(sq); pos.z /= sqrt(sq);
+    } else if (uAnimMode == 4) {             // float / gentle bob + drift
+      pos.y += sin(ph) * 0.12 * aA;
+      pos.x += sin(ph*0.6 + home.y*2.0) * 0.05 * aA;
+    } else if (uAnimMode == 5) {             // jelly / soft-body wobble
+      pos += sin(vec3(ph*1.7) + home*6.0) * (0.06 * aA);
+    } else if (uAnimMode == 6) {             // wave travelling across x
+      pos.y += sin(ph + home.x*4.0) * 0.12 * aA;
+    } else if (uAnimMode == 7) {             // spin (turntable)
+      float c = cos(ph), s = sin(ph);
+      pos.xz = mat2(c, -s, s, c) * pos.xz;
+    } else if (uAnimMode == 8 || uAnimMode == 9) {
+      // SMOOTH skinning (no torn body): each limb gets a continuous weight that
+      // fades to 0 toward the torso, so swings blend in instead of cutting. The
+      // hip/shoulder heights + center are FITTED to this model (uniforms), so it
+      // adapts to the generated shape instead of using fixed thresholds.
+      float cx = uRigCenterX, hipY = uRigHipY, shY = uRigShoulderY;
+      vec3 X = vec3(1.0,0.0,0.0), Z = vec3(0.0,0.0,1.0);
+      float leftn  = 1.0 - smoothstep(cx-0.02, cx+0.10, home.x);   // 1 on the left
+      float rightn = smoothstep(cx-0.10, cx+0.02, home.x);          // 1 on the right
+      float low    = 1.0 - smoothstep(hipY-0.04, hipY+0.18, home.y);// 1 below hips (legs)
+      float side   = smoothstep(0.08, 0.26, abs(home.x-cx));        // 1 at the sides (arms)
+      float armB   = smoothstep(hipY-0.05, shY, home.y) * (1.0 - smoothstep(shY, shY+0.18, home.y));
+      float wLegL=low*leftn, wLegR=low*rightn, wArmL=side*armB*leftn, wArmR=side*armB*rightn;
+      vec3 d = vec3(0.0);
+      if (uAnimMode == 8) {                  // WALK: legs alternate, arms counter-swing
+        float sw = sin(ph) * 0.55 * aA;
+        d += (swing(home, vec3(cx-0.10,hipY,0.0), X,  sw)     - home) * wLegL;
+        d += (swing(home, vec3(cx+0.10,hipY,0.0), X, -sw)     - home) * wLegR;
+        d += (swing(home, vec3(cx-0.18,shY,0.0),  X, -sw*0.7) - home) * wArmL;
+        d += (swing(home, vec3(cx+0.18,shY,0.0),  X,  sw*0.7) - home) * wArmR;
+        pos += d; pos.y += abs(sin(ph))*0.03*aA;     // body bob
+      } else {                               // WAVE: raise & wag the right arm
+        float raise = (1.3 + 0.5*sin(ph*4.0)) * aA;
+        d += (swing(home, vec3(cx+0.16,shY,0.0), Z, -raise) - home) * wArmR;
+        pos += d;
+      }
+    }
+  }
+
+  // 🌀 microbot flow: particles drift on a bounded curl-like field so the object
+  // is ALWAYS gently alive (Big-Hero-6 microbots), shape held. ~9 sin/cos/vertex
+  // -> runs on a low-end laptop GPU. Same formula as motion/flow.py.
+  if (uAnimMode == 10) {
+    float ff = 2.3, aA = uAnimAmp, ph = uAnimT;
+    vec3 q = home*ff + vec3(ph*0.6, ph*0.5, ph*0.7);
+    vec3 fl = vec3(sin(q.y)*cos(q.z), sin(q.z)*cos(q.x), sin(q.x)*cos(q.y));
+    fl.x += 0.5*sin(ph*0.30 + home.y*1.5);
+    fl.y += 0.5*cos(ph*0.27 + home.z*1.5);
+    fl.z += 0.5*sin(ph*0.33 + home.x*1.5);
+    pos += fl * (0.06 * aA);
+  }
+
+  // 🦴 learned rig (mode 11): the SERVER's rig predictor found this model's
+  // joints (/v1/rig); each particle binds to its nearest DISTAL joint — same
+  // rule as rigging/live_rig.bind_joints — and follows that joint's FK rigid
+  // transform. TRUE forward kinematics: JS composes per-joint mat3+offset down
+  // each chain every frame (16 tiny matrices), the GPU just applies its one —
+  // segments stay coherent instead of shearing, at zero extra vertex cost.
+  if (uAnimMode == 11 && uNJ > 0) {
+    int bj = -1; float bd = 1e9; float bproj = 0.0;
+    for (int k = 0; k < 16; k++) {
+      if (k >= uNJ) break;
+      float proj = dot(home - uJPos[k], uJOut[k]);
+      if (proj > 0.0) {
+        float dd = distance(home, uJPos[k]);
+        if (dd < bd) { bd = dd; bj = k; bproj = proj; }
+      }
+    }
+    if (bj >= 0) {
+      float w = smoothstep(0.0, uJReach*0.5, bproj);
+      vec3 posed = uJRot[bj]*home + uJTrans[bj];
+      pos += (posed - home) * (w * uAnimAmp);
+    }
+  }
+
+  // 💧 water (12) / 🏜 soil (13): stateless GPU material approximations —
+  // uAnimAmp is the MELT fraction (ramps on activate, reverses on stop), so a
+  // model can dissolve into a puddle / crumble into a mound and re-freeze.
+  // (The server's PBD is the real simulation; this is its bounded visual twin.)
+  if (uAnimMode == 12) {
+    float m = uAnimAmp; vec3 hh = hash3(home*3.7);
+    float fall = smoothstep(0.0, 1.0, m*1.35 - hh.x*0.35);
+    float py = uFloorY + 0.02 + hh.x*0.05;
+    vec3 dirout = normalize(vec3(home.x, 0.0, home.z) + vec3(1e-4));
+    vec3 puddle = vec3(home.x, py, home.z) + dirout*(0.55 + 0.7*hh.y)*fall;
+    puddle.x += 0.04*sin(uAnimT*1.7 + home.z*9.0);      // surface ripple
+    puddle.z += 0.04*cos(uAnimT*1.5 + home.x*9.0);
+    pos = mix(pos, puddle, fall);
+  }
+  if (uAnimMode == 13) {
+    float m = uAnimAmp; vec3 hh = hash3(home*5.1);
+    float p = clamp((m*1.5 - hh.x*0.8)/0.5, 0.0, 1.0);  // grains break loose in waves
+    p = p*p*(3.0-2.0*p);
+    float pile = uFloorY + 0.02 + hh.y*hh.y*0.30;       // mound keeps thickness
+    vec3 crumb = vec3(home.x*(1.0+0.25*p*hh.z), pile, home.z*(1.0+0.25*p*hh.x));
+    crumb.x += 0.015*sin(uAnimT*0.8 + hh.y*20.0)*p;     // grains settle, not flow
+    pos = mix(pos, crumb, p);
+  }
+
+  // 👁 semantic micro-parts: eye particles blink — ONLY the particles inside a
+  // detected eye sphere squash shut. Part-level realtime control on the GPU:
+  // the same channel later drives mouths, ears, leaves, wheels.
+  if (uNEye > 0 && uBlink > 0.001) {
+    for (int e = 0; e < 4; e++) {
+      if (e >= uNEye) break;
+      float dd = distance(home, uEyes[e].xyz);
+      float inEye = 1.0 - smoothstep(uEyes[e].w*0.85, uEyes[e].w*1.25, dd);
+      if (inEye > 0.0) {
+        float lid = uEyes[e].xyz.y + uEyes[e].w*(1.0 - 2.0*uBlink);   // lid sweeps down
+        pos.y -= max(0.0, home.y - lid) * inEye * 0.92;
+      }
+    }
   }
 
   pos *= uModelScale;                       // LLM can shrink/grow the whole model
@@ -225,9 +383,9 @@ void main(){
   vec2 major = min(3.0*sqrt(l1), 256.0) * e1;
   vec2 minor = min(3.0*sqrt(l2), 256.0) * e2;
 
-  // colors EMERGE as the form settles (soft glow while scattered -> true color)
-  vColor = mix(vec3(0.78, 0.86, 1.0), color, smoothstep(0.15, 0.92, e));
-  vOpacity = opacity * mix(0.5, 1.0, e);   // scattered particles dimmer -> calmer transition
+  // keep each particle's real color through the whole morph (no white-out)
+  vColor = color;
+  vOpacity = opacity * mix(0.62, 1.0, e);   // scattered particles a bit dimmer -> calmer
   vQuad = aCorner;
   vec2 ndc = clip.xy / clip.w;
   vec2 offset = (aCorner.x*major + aCorner.y*minor) * 2.0 / uViewport;
@@ -256,7 +414,7 @@ if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(pro
 gl.useProgram(prog);
 
 const U = {};
-["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uSwirl","uFxMode","uFxCenter","uFxAmt"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uSwirl","uFxMode","uFxCenter","uFxAmt","uAnimMode","uAnimT","uAnimAmp","uRigHipY","uRigShoulderY","uRigCenterX","uNJ","uJPos","uJOut","uJReach","uJRot","uJTrans","uNEye","uEyes","uBlink","uFloorY"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
 // quad corners (triangle strip) + per-instance index buffer
 const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -267,6 +425,20 @@ const idxBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
 gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1,1,gl.UNSIGNED_INT,0,0); gl.vertexAttribDivisor(1,1);
 const dataTex = gl.createTexture();
 let COUNT = 0, TEXW = 2048, homePos = null, order = null, depths = null;
+const fixedBudget = QS.has("budget");
+function initialCartridgeBudget(){
+  const explicit = parseInt(QS.get("budget") || "", 10);
+  if(Number.isFinite(explicit) && explicit > 0) return explicit;
+  const mem = navigator.deviceMemory || 8;
+  const cores = navigator.hardwareConcurrency || 8;
+  if(mem <= 4 || cores <= 4) return 50000;
+  if(mem <= 8 || cores <= 8) return 90000;
+  return 180000;
+}
+let cartridgeBudget = initialCartridgeBudget();
+let lastCartridgeFormat = "SPL2";
+let cartridgeLoading = false;
+let lastLodAdjust = 0;
 
 // ============================================================= math =========
 function perspective(fovy, aspect, near, far){
@@ -292,6 +464,123 @@ function camTo(y,p,d,ms){ cam.active=true; cam.fy=yaw; cam.fp=pitch; cam.fd=dist
 // model scale (LLM can shrink/grow) — animated
 let modelScale=1; const ms={active:false,f:1,t:1,t0:0,dur:800};
 function scaleTo(s,dur){ ms.active=true; ms.f=modelScale; ms.t=s; ms.t0=performance.now(); ms.dur=dur||800; }
+// procedural deformation animation (canonical -> time-warp). amp ramps in/out.
+const ANIM = {none:0,breathe:1,sway:2,bounce:3,float:4,jelly:5,wave:6,spin:7,walk:8,handwave:9,flow:10,rig:11,water:12,soil:13};
+// default: 🌀 microbot flow always on — particles are alive from the first frame,
+// gently flowing on the field (shape held) instead of sitting static or popping.
+const av = { mode:10, amp:0, target:1, speed:2.4, until:0 };
+function animate(style, ms2){
+  const m = ANIM[style] ?? (style==="stop"||style==="none" ? 0 : av.mode);
+  if(m){ av.mode=m; av.target=1;
+    av.speed = style==="spin"?1.0 : (style==="walk")?6.0 : (style==="handwave")?3.0
+             : (style==="breathe"||style==="float")?1.6 : 2.4;
+    av.until = ms2 ? performance.now()+ms2 : 0;   // 0 = run until stopped
+  } else { av.target=0; av.until=0; }
+}
+// 🦴 learned rig: server-predicted joints (/v1/rig) + ATANOR mood (/v1/rig_mood
+// dry) -> per-joint drives computed here each frame, skinning runs in the
+// vertex shader. When the server has no matching field, lrig stays null and
+// mode 11 is a no-op (uNJ = 0).
+let lrig = null;
+let modelFloorY = -1;
+// NEUTRAL idle for generated objects. Mood only ever overwrites this when the
+// server says the displayed field IS the machine's own character (avatar) —
+// objects made to explain things do not carry the machine's emotions.
+const MOOD = { amp:0.35, tempo:0.8, jitter:0.05, droop:0.0 };
+const jDrives = new Float32Array(16);
+const jRot = new Float32Array(16*9), jTrans = new Float32Array(16*3);
+async function fetchRig(){
+  try{
+    const r = await fetch("/v1/rig"); if(!r.ok){ lrig=null; return; }
+    const d = await r.json();
+    const flat = k => { const a=new Float32Array(48); d[k].forEach((v,i)=>a.set(v,i*3)); return a; };
+    lrig = { n: Math.min(d.n_joints,16), pos: flat("joints"), out: flat("outward"),
+             joints: d.joints, chains: d.chains, centroid: d.centroid,
+             reach: d.reach, avatar: !!d.avatar };
+  }catch(e){ lrig=null; }
+  fetchParts();
+}
+// 👁 semantic parts (eyes for now): tiny color-contrast clusters the server
+// found on this model — the blink channel drives ONLY those particles.
+let parts = null; const eyeVec = new Float32Array(16);
+async function fetchParts(){
+  try{
+    const r = await fetch("/v1/parts"); if(!r.ok){ parts=null; return; }
+    const d = await r.json();
+    parts = { eyes: (d.eyes||[]).slice(0,4) };
+    eyeVec.fill(0);
+    parts.eyes.forEach((e,i)=>{ eyeVec.set([e.center[0],e.center[1],e.center[2],e.radius], i*4); });
+  }catch(e){ parts=null; }
+}
+let blink = 0;                                   // 0 open .. 1 closed
+function blinkClock(t){                          // natural double-ish blinks
+  const cyc = t % 4.2;
+  if(cyc < 0.28){ const u = cyc/0.14; blink = u<1 ? u : 2-u; }   // close+open 280ms
+  else blink = 0;
+}
+// FK: compose each chain's per-joint rigid transform (rot about moving pivots),
+// exactly rigging/live_rig.pose_chain — done here on 16 joints, applied on GPU.
+function m3axis(ax,ay,az,a){ const c=Math.cos(a),s=Math.sin(a),t=1-c;
+  return [t*ax*ax+c,t*ax*ay-s*az,t*ax*az+s*ay, t*ax*ay+s*az,t*ay*ay+c,t*ay*az-s*ax,
+          t*ax*az-s*ay,t*ay*az+s*ax,t*az*az+c]; }
+function m3mul(A,B){ const R=new Array(9);
+  for(let r=0;r<3;r++)for(let c=0;c<3;c++)
+    R[r*3+c]=A[r*3]*B[c]+A[r*3+1]*B[3+c]+A[r*3+2]*B[6+c];
+  return R; }
+function m3v(A,v){ return [A[0]*v[0]+A[1]*v[1]+A[2]*v[2],
+                           A[3]*v[0]+A[4]*v[1]+A[5]*v[2],
+                           A[6]*v[0]+A[7]*v[1]+A[8]*v[2]]; }
+function computeFK(t){
+  const I=[1,0,0,0,1,0,0,0,1];
+  for(let k=0;k<16;k++){ jRot.set(I,k*9); jTrans.set([0,0,0],k*3); }
+  if(!lrig) return;
+  for(let k=0;k<lrig.n;k++) jDrives[k] =
+    MOOD.amp*Math.sin(MOOD.tempo*t + k*1.7) + MOOD.jitter*0.3*Math.sin(7.3*t + k*2.9) - MOOD.droop*0.35;
+  for(const chain of (lrig.chains||[])){
+    const Jw = chain.map(j=>lrig.joints[j].slice());       // working joints
+    let prev = lrig.centroid.slice();
+    let R = I.slice(), T = [0,0,0];                        // running transform
+    for(let c=0;c<chain.length;c++){
+      const j = chain[c]; if(j>=16) continue;
+      let d=[Jw[c][0]-prev[0],Jw[c][1]-prev[1],Jw[c][2]-prev[2]];
+      let n=Math.hypot(...d); d = n>1e-5 ? d.map(x=>x/n) : [lrig.out[j*3],lrig.out[j*3+1],lrig.out[j*3+2]];
+      let ax=[d[2],0,-d[0]]; n=Math.hypot(...ax);          // cross(d, up)
+      ax = n>1e-4 ? ax.map(x=>x/n) : [1,0,0];
+      const Rk = m3axis(ax[0],ax[1],ax[2], jDrives[j]);
+      const piv = Jw[c];
+      // running: x -> Rk*(x - piv) + piv, composed after previous transform
+      const Rn = m3mul(Rk, R);
+      const Tk = m3v(Rk, [T[0]-piv[0], T[1]-piv[1], T[2]-piv[2]]);
+      const Tn = [Tk[0]+piv[0], Tk[1]+piv[1], Tk[2]+piv[2]];
+      R = Rn; T = Tn;
+      jRot.set(R, j*9); jTrans.set(T, j*3);
+      for(let m=c+1;m<chain.length;m++){                   // downstream joints ride
+        const v = m3v(Rk, [Jw[m][0]-piv[0], Jw[m][1]-piv[1], Jw[m][2]-piv[2]]);
+        Jw[m] = [v[0]+piv[0], v[1]+piv[1], v[2]+piv[2]];
+      }
+      prev = Jw[c];
+    }
+  }
+}
+async function pollMood(){
+  if(!lrig || !lrig.avatar) return;              // emotion: machine character ONLY
+  try{
+    const r = await fetch("/v1/rig_mood", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({dry:true})});
+    if(!r.ok) return;
+    const p = (await r.json()).params;
+    MOOD.amp=p.amp; MOOD.tempo=p.tempo; MOOD.jitter=p.jitter; MOOD.droop=p.droop;
+  }catch(e){}
+}
+setInterval(()=>{ if(av.mode===11) pollMood(); }, 5000);
+// ATANOR dashboard bridge: when the studio runs embedded (/studio3d iframe),
+// the dashboard drives it by message — animate styles, cartridge reload.
+window.addEventListener("message", (ev)=>{
+  const m = ev.data;
+  if(!m || !m.splatra) return;
+  if(m.splatra === "animate") animate(m.style || "flow");
+  else if(m.splatra === "reload"){ disassemble(); setTimeout(()=>loadCartridge(true).catch(()=>{}), 520); }
+});
 // rotation-style morph: a single monotonic Y-spin (half turn out, half turn in).
 const TWO_PI=2*Math.PI; let swirl=0; const sw={active:false,f:0,t:0,t0:0,dur:800};
 function swirlTo(target,dur){ sw.active=true; sw.f=swirl; sw.t=target; sw.t0=performance.now(); sw.dur=dur||800; }
@@ -348,6 +637,9 @@ function resize(){
 // ====================================================== covariance / upload =
 function uploadModel(pos, col, scale, quat, opa){
   const n = opa.length;
+  modelFloorY = Infinity;                      // material modes melt onto this
+  for(let i=0;i<n;i++) if(pos[3*i+1] < modelFloorY) modelFloorY = pos[3*i+1];
+  if(!isFinite(modelFloorY)) modelFloorY = -1;
   const texH = Math.ceil(n*4 / TEXW);
   const tex = new Float32Array(TEXW * texH * 4);
   for (let i=0;i<n;i++){
@@ -384,7 +676,23 @@ function uploadModel(pos, col, scale, quat, opa){
   order = new Uint32Array(n); for(let i=0;i<n;i++) order[i]=i;
   depths = new Float32Array(n);
   lastSortKey = "";
-  document.getElementById("countPill").textContent = n.toLocaleString() + " splats";
+  fitRig(pos, n);                       // place hip/shoulder joints for this model's proportions
+  document.getElementById("countPill").textContent = `${n.toLocaleString()} splats · ${lastCartridgeFormat}`;
+}
+// Fit a coarse upright skeleton to the actual point cloud so limb motion adapts
+// to the generated shape (vs fixed thresholds). Uses the vertical extent + the
+// centroid x, with robust 2%/98% percentiles to ignore stray points.
+const rig = { hipY:-0.3, shoulderY:0.35, centerX:0 };
+function fitRig(pos, n){
+  const ys = []; let sx=0;
+  const step = Math.max(1, (n/20000)|0);          // subsample for speed
+  for(let i=0;i<n;i+=step){ ys.push(pos[i*3+1]); sx += pos[i*3]; }
+  ys.sort((a,b)=>a-b);
+  const lo = ys[Math.floor(ys.length*0.02)], hi = ys[Math.floor(ys.length*0.98)];
+  const h = Math.max(1e-3, hi-lo);
+  rig.hipY      = lo + h*0.46;          // hips ~46% up
+  rig.shoulderY = lo + h*0.74;          // shoulders ~74% up
+  rig.centerX   = sx / Math.max(1, Math.ceil(n/step));
 }
 
 // ====================================================== depth sort (16-bit) =
@@ -461,17 +769,40 @@ function frame(){
     gl.uniform1f(U.uT, anim.t); gl.uniform1f(U.uSizeScale, sizeScale); gl.uniform1f(U.uTime, now*0.001);
     gl.uniform1f(U.uModelScale, modelScale); gl.uniform1f(U.uSwirl, swirl);
     gl.uniform1i(U.uFxMode, fx.mode); gl.uniform3fv(U.uFxCenter, fx.center); gl.uniform1f(U.uFxAmt, fx.amt);
+    if(av.until && now>av.until) av.target=0;              // timed animation auto-stops
+    av.amp += (av.target - av.amp) * 0.06;                 // smooth ramp in/out
+    if(av.amp < 0.004 && av.target===0) av.mode=0;
+    gl.uniform1i(U.uAnimMode, av.mode); gl.uniform1f(U.uAnimT, now*0.001*av.speed); gl.uniform1f(U.uAnimAmp, av.amp);
+    gl.uniform1f(U.uRigHipY, rig.hipY); gl.uniform1f(U.uRigShoulderY, rig.shoulderY); gl.uniform1f(U.uRigCenterX, rig.centerX);
+    if(av.mode===11 && lrig){
+      computeFK(now*0.001);                    // FK rigid transforms, 16 joints
+      gl.uniform1i(U.uNJ, lrig.n); gl.uniform3fv(U.uJPos, lrig.pos);
+      gl.uniform3fv(U.uJOut, lrig.out); gl.uniform1f(U.uJReach, lrig.reach);
+      gl.uniformMatrix3fv(U.uJRot, true, jRot); gl.uniform3fv(U.uJTrans, jTrans);
+    } else { gl.uniform1i(U.uNJ, 0); }
+    if(parts && parts.eyes.length){            // 👁 blink only detected eyes
+      blinkClock(now*0.001);
+      gl.uniform1i(U.uNEye, parts.eyes.length); gl.uniform4fv(U.uEyes, eyeVec);
+      gl.uniform1f(U.uBlink, blink);
+    } else { gl.uniform1i(U.uNEye, 0); gl.uniform1f(U.uBlink, 0); }
+    gl.uniform1f(U.uFloorY, modelFloorY);
     updateOverlays(proj, view);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
   }
   frames++;
-  if(now-fpsT>500){ document.getElementById("fps").textContent = Math.round(frames*1000/(now-fpsT))+" fps · "+COUNT.toLocaleString()+" splats"; frames=0; fpsT=now; }
+  if(now-fpsT>500){
+    const fps = Math.round(frames*1000/(now-fpsT));
+    document.getElementById("fps").textContent = `${fps} fps · ${COUNT.toLocaleString()} splats · budget ${cartridgeBudget.toLocaleString()}`;
+    maybeAdaptLod(fps, now);
+    frames=0; fpsT=now;
+  }
 }
 window.__render = frame;
 setInterval(frame, 16);   // setInterval so a backgrounded tab keeps rendering
 
 // ============================================================= input ========
 let drag=null;
+let invertDrag = localStorage.getItem("invertDrag")==="1";
 canvas.addEventListener("contextmenu", e=>e.preventDefault());
 canvas.addEventListener("mousedown", e=>{ drag={x:e.clientX,y:e.clientY,pan:(e.button===2||e.shiftKey)}; });
 addEventListener("mouseup", ()=>drag=null);
@@ -480,21 +811,37 @@ addEventListener("mousemove", e=>{
   const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
   if(drag.pan){ const r=norm(cross([0,1,0],[Math.sin(yaw),0,Math.cos(yaw)])); const k=dist*0.0016;
     target[0]-=r[0]*dx*k; target[2]-=r[2]*dx*k; target[1]+=dy*k; }
-  else { yaw-=dx*0.01; pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*0.01)); }  // drag follows the surface
+  else { const s=invertDrag?-1:1; yaw+=dx*0.01*s; pitch=Math.max(-1.45,Math.min(1.45,pitch-dy*0.01*s)); }  // orbit (⇄ invert flips both axes)
 });
 canvas.addEventListener("wheel", e=>{ e.preventDefault(); dist=Math.max(1.3,Math.min(9,dist*(1+e.deltaY*0.0012))); }, {passive:false});
 document.getElementById("spin").onclick = e=>{ autospin=!autospin; e.target.classList.toggle("on",autospin); e.target.textContent=autospin?"⏸ spin":"▶ spin"; };
+{ const ib=document.getElementById("invert"); ib.classList.toggle("on",invertDrag);
+  ib.onclick=()=>{ invertDrag=!invertDrag; localStorage.setItem("invertDrag",invertDrag?"1":"0"); ib.classList.toggle("on",invertDrag); }; }
+document.querySelectorAll("#anim .anim").forEach(b=>b.onclick=()=>{
+  const a=b.dataset.a; animate(a);
+  document.querySelectorAll("#anim .anim").forEach(x=>x.classList.toggle("on", x===b && a!=="stop"));
+  if(a==="stop") document.querySelectorAll("#anim .anim").forEach(x=>x.classList.remove("on"));
+});
 document.getElementById("reassemble").onclick = ()=>{ anim.t=0; tween(1,1500); };
 document.getElementById("cycle").onclick = e=>{ if(anim.mode==="cycle"){ anim.mode="idle"; tween(1,600); e.target.classList.remove("on"); }
   else { anim.mode="cycle"; anim.t0=performance.now(); e.target.classList.add("on"); } };
 document.getElementById("sizeR").oninput = e=>{ sizeScale=parseFloat(e.target.value); };
 
 // ============================================================= cartridge ====
-async function loadCartridge(animate=true, url=null){
-  const u = url || `${API}/v1/cartridge?_=${Date.now()}`;
-  const b = await (await fetch(u)).arrayBuffer();
-  const dv = new DataView(b);
-  // magic "SPL2" (4 bytes) + uint32 N
+function halfToFloat(h){
+  const s = (h & 0x8000) ? -1 : 1;
+  const e = (h >> 10) & 0x1f;
+  const f = h & 0x03ff;
+  if(e === 0) return s * Math.pow(2, -14) * (f / 1024);
+  if(e === 31) return f ? NaN : s * Infinity;
+  return s * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+
+function magicOf(dv){
+  return String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+}
+
+function parseSPL2(b, dv){
   const n = dv.getUint32(4, true);
   let o = 8;
   const pos=new Float32Array(b,o,n*3); o+=n*12;
@@ -502,9 +849,71 @@ async function loadCartridge(animate=true, url=null){
   const scale=new Float32Array(b,o,n*3); o+=n*12;
   const quat=new Float32Array(b,o,n*4); o+=n*16;
   const opa=new Float32Array(b,o,n);
-  uploadModel(pos,col,scale,quat,opa);
-  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700); swirlSettle(1700);  // another half-turn in, same direction
-    if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
+  lastCartridgeFormat = "SPL2";
+  return {pos,col,scale,quat,opa};
+}
+
+function parseSPL3(b, dv){
+  const n = dv.getUint32(4, true);
+  const min=[dv.getFloat32(8,true), dv.getFloat32(12,true), dv.getFloat32(16,true)];
+  const max=[dv.getFloat32(20,true), dv.getFloat32(24,true), dv.getFloat32(28,true)];
+  const span=[Math.max(1e-8, max[0]-min[0]), Math.max(1e-8, max[1]-min[1]), Math.max(1e-8, max[2]-min[2])];
+  let o = 32;
+  const pos = new Float32Array(n*3);
+  for(let i=0;i<n*3;i++){
+    const axis=i%3;
+    const q=dv.getInt16(o,true); o+=2;
+    pos[i]=min[axis] + ((q + 32768) / 65535) * span[axis];
+  }
+  const col = new Float32Array(n*3);
+  for(let i=0;i<n*3;i++) col[i]=dv.getUint8(o++)/255;
+  const scale = new Float32Array(n*3);
+  for(let i=0;i<n*3;i++){ scale[i]=halfToFloat(dv.getUint16(o,true)); o+=2; }
+  const quat = new Float32Array(n*4);
+  for(let i=0;i<n*4;i++) quat[i]=Math.max(-1, dv.getInt8(o++)/127);
+  const opa = new Float32Array(n);
+  for(let i=0;i<n;i++) opa[i]=dv.getUint8(o++)/255;
+  lastCartridgeFormat = "SPL3";
+  return {pos,col,scale,quat,opa};
+}
+
+function cartridgeUrl(){
+  const sep = API.includes("?") ? "&" : "?";
+  return `${API}/v1/cartridge${sep}format=spl3&budget=${Math.max(1, cartridgeBudget|0)}&_=${Date.now()}`;
+}
+
+function maybeAdaptLod(fps, now){
+  if(fixedBudget || !ONLINE || cartridgeLoading || !COUNT) return;
+  if(now - lastLodAdjust < 9000) return;
+  if(fps < 34 && cartridgeBudget > 45000){
+    cartridgeBudget = Math.max(45000, Math.floor(cartridgeBudget * 0.65));
+    lastLodAdjust = now;
+    loadCartridge(false).catch(()=>{});
+  } else if(fps > 57 && COUNT >= cartridgeBudget * 0.92 && cartridgeBudget < 180000) {
+    cartridgeBudget = Math.min(180000, Math.floor(cartridgeBudget * 1.25));
+    lastLodAdjust = now;
+    loadCartridge(false).catch(()=>{});
+  }
+}
+
+async function loadCartridge(animate=true, url=null){
+  if(cartridgeLoading) return;
+  cartridgeLoading = true;
+  try{
+    const u = url || cartridgeUrl();
+    const b = await (await fetch(u)).arrayBuffer();
+    const dv = new DataView(b);
+    const magic = magicOf(dv);
+    if(magic !== "SPL2" && magic !== "SPL3") throw new Error(`unknown cartridge format ${magic}`);
+    const parsed = magic === "SPL3" ? parseSPL3(b, dv) : parseSPL2(b, dv);
+    const {pos,col,scale,quat,opa} = parsed;
+    uploadModel(pos,col,scale,quat,opa);
+    if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700); swirlSettle(1700);  // another half-turn in, same direction
+      if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
+    fetchRig();     // ask the server for this model's learned rig (null if none)
+  } finally {
+    cartridgeLoading = false;
+  }
 }
 
 // ============================================================= chat =========
@@ -539,17 +948,18 @@ async function sendMsg(text){
   if(isExplain(text)){ return narrate(text); }    // auto-route to narration
   add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
   disassemble();   // current model bursts into particles + swirls while generating
-  const model=document.getElementById("model").value;
   try{
-    const r=await fetch(`${API}/v1/chat`,{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message:text, model:model==="heuristic"?null:model, use_ollama:model!=="heuristic"})});
+    // Build commands (incl. sentence-form like "a girl wearing a hat") go straight
+    // to generation with the raw prompt — reliable, no LLM tool-call in the loop.
+    await fetch(`${API}/v1/scene/clear`,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    const r=await fetch(`${API}/v1/scene/spawn`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({prompt:text, id:"obj", position:[0,0,0], scale:1.0})});
     const d=await r.json();
+    if(!d.ok){ throw new Error(d.detail||"generation failed"); }
     document.getElementById("enginePill").textContent=d.engine;
-    add("bot",`<span class="eng">${d.engine}</span><br>${(d.assistant||"(no reply)").replace(/</g,"&lt;")}`);
-    (d.actions||[]).forEach(a=>{ const bits=[`<b>${a.tool}</b>`,a.shape?"shape "+a.shape:"",a.name||"",a.ok?"ok":"FAILED",a.verified?"verified":"",
-      a.auto_score!=null?("auto "+a.auto_score+"/100"):""].filter(Boolean).join(" · "); add("act",bits);
-      if(a.name) showRating(a.name, text, a.auto_score); });
-    setState(d.state); setSgf(d.sgf,d.edges); await loadCartridge(true);
+    add("bot",`<span class="eng">${d.engine}</span><br>built “${text.replace(/</g,"&lt;")}”`);
+    setState("DISPLAYED"); setSgf(d.sgf,0); await loadCartridge(true);
+    showRating("obj", text, null);
   }catch(e){ add("bot",`<span class="eng">error</span><br>API unreachable: ${e}`); setState("ERROR"); }
   finally{ send.disabled=false; input.focus(); }
 }
@@ -574,8 +984,27 @@ function speak(text){ return new Promise(res=>{
     u.onerror=()=>{ clearTimeout(safety); finish(); };
     speechSynthesis.speak(u);
   }catch(e){ clearTimeout(safety); setTimeout(finish, dur); } }); }
-function runAction(a){
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+async function sceneSpawn(a){            // build a 3D object in the scene at a spot
+  const r=await fetch(`${API}/v1/scene/spawn`,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({prompt:a.prompt, id:a.id, position:a.at||null, scale:a.scale??1.0})});
+  const d=await r.json();
+  await loadCartridge((d.objects||[]).length<=1);   // morph-assemble the first object; later ones just appear
+}
+async function sceneMove(a){            // animate an object (e.g. apple falling)
+  let from=a.from;
+  if(!from){ try{ const s=await(await fetch(`${API}/v1/scene`)).json(); from=(s.objects.find(o=>o.id===a.id)||{}).position; }catch(e){} }
+  from=from||a.to; const steps=6, dur=a.ms??1200;
+  for(let k=1;k<=steps;k++){ const t=k/steps;
+    const pos=[from[0]+(a.to[0]-from[0])*t, from[1]+(a.to[1]-from[1])*t, from[2]+(a.to[2]-from[2])*t];
+    await fetch(`${API}/v1/scene/move`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:a.id,position:pos})});
+    await loadCartridge(false); await wait(dur/steps);
+  }
+}
+function runAction(a){                   // returns a promise for async (spawn/move) actions
   if(!a||!a.type) return;
+  if(a.type==="spawn") return sceneSpawn(a);
+  if(a.type==="move") return sceneMove(a);
   if(a.type==="focus") camTo(a.yaw??yaw, a.pitch??pitch, a.dist??dist, a.ms??1200);
   else if(a.type==="spin"||a.type==="orbit"){ autospin=true; setTimeout(()=>autospin=false, a.ms??1500); }
   else if(a.type==="charge") setFx(1, a.center, a.ms??1500);
@@ -584,12 +1013,17 @@ function runAction(a){
   else if(a.type==="scale") scaleTo(a.to??0.6, a.ms??900);
   else if(a.type==="arrow"&&a.from&&a.to) addArrow(a.from, a.to, a.ms??3000);
   else if(a.type==="label"&&a.at&&a.text) addLabel(a.at, a.text, a.ms??3500);
+  else if(a.type==="animate") animate(a.style||"float", a.ms??0);   // procedural motion
 }
 async function playScript(steps){
-  clearOverlays(); scaleTo(1,1);
-  for(const s of (steps||[])){ runAction(s.action); add("act","🔊 "+(s.say||"")); await speak(s.say); }
-  await new Promise(r=>setTimeout(r,1200));
-  fx.mode=0; fx.amt=0; autospin=false; scaleTo(1,800); clearOverlays();
+  clearOverlays();
+  for(const s of (steps||[])){
+    const p=runAction(s.action);        // fire the action (may be async)
+    if((s.say||"").trim()) add("act","🔊 "+s.say);
+    await speak(s.say);                 // narrate while it works
+    if(p) await p;                      // ensure spawn/move finished before next step
+  }
+  await wait(1000); fx.mode=0; fx.amt=0; autospin=false; scaleTo(1,800); clearOverlays();
 }
 const narrBtn=document.getElementById("narr");
 async function narrate(text){
@@ -602,10 +1036,11 @@ async function narrate(text){
     const r=await fetch(`${API}/v1/narrate`,{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({prompt:text, topic:text, model:model==="heuristic"?null:model, lang:(/[가-힣]/.test(text))?"ko":"en"})});
     const d=await r.json();
-    add("bot",`<span class="eng">${d.engine} · director ${d.director}</span><br>built “${d.name}”, narrating ${d.script.length} steps…`);
-    setState("DISPLAYED"); setSgf(d.sgf,0); await loadCartridge(true);
-    await new Promise(r=>setTimeout(r,1400));   // let it assemble first
-    await playScript(d.script);
+    document.getElementById("enginePill").textContent="director:"+d.director;
+    add("bot",`<span class="eng">director ${d.director}</span><br>building the scene — ${d.script.length} steps…`);
+    setState("GENERATING");
+    await playScript(d.script);          // spawn actions build the scene live
+    setState("DISPLAYED");
   }catch(e){ add("bot",`<span class="eng">error</span><br>${e}`); setState("ERROR"); }
   finally{ narrBtn.disabled=send.disabled=false; }
 }

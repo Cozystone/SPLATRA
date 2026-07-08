@@ -27,9 +27,10 @@ DEFAULT_HOST = "http://localhost:11434"
 
 SYSTEM_PROMPT = (
     "You drive a 3D Gaussian hologram engine. Use the provided tools. "
-    "Call render_knowledge_hologram to visualize a knowledge graph, or "
-    "generate_3d_object to create a 3D object from a text prompt. "
-    "Prefer calling a tool over answering in prose."
+    "For a SINGLE object, call generate_3d_object. For an EXPLANATION of several "
+    "things (comparisons, systems, relationships), call explain_scene with all the "
+    "objects and the links between them, so they appear together in one 3D space. "
+    "Call render_knowledge_hologram for an abstract graph. Prefer a tool over prose."
 )
 
 # Used when the model lacks native tool support; forced via format="json".
@@ -37,12 +38,16 @@ JSON_PROMPT = (
     "You control a 3D Gaussian hologram engine. For the user's request, choose "
     "exactly ONE tool and reply with ONLY a JSON object (no prose, no markdown):\n"
     '1) {"tool":"generate_3d_object","arguments":{"prompt":"<the object in '
-    'English, e.g. a red apple, a pikachu, a teapot>"}}  — to create a 3D model '
-    "of ANY object from a description. Translate the object to English. Do NOT "
-    'add a "shape" field unless the user literally asks for a geometric primitive '
-    '(then add "shape":"sphere|cube|torus|spiral").\n'
-    '2) {"tool":"render_knowledge_hologram","arguments":{"_sample_n":<int 3-120>}}'
-    "  — to visualize a knowledge graph / network of N nodes.\n"
+    'English, e.g. a red apple, a pikachu, a teapot>"}}  — ONE 3D object. '
+    "Translate to English. Do NOT add a \"shape\" field unless the user literally "
+    'asks for a geometric primitive (then "shape":"sphere|cube|torus|spiral").\n'
+    '2) {"tool":"explain_scene","arguments":{"objects":[{"prompt":"<object in '
+    'English>","id":"<short handle>","label":"<caption>"}, ...],"links":[["id1",'
+    '"id2"], ...]}}  — an EXPLANATION with SEVERAL objects placed together in one '
+    "3D space and connected. Use this whenever the user asks to explain, compare, "
+    "or show more than one thing (e.g. a solar system, an atom, a food chain).\n"
+    '3) {"tool":"render_knowledge_hologram","arguments":{"_sample_n":<int 3-120>}}'
+    "  — an abstract graph / network of N nodes.\n"
     "Output one JSON object of that exact form."
 )
 

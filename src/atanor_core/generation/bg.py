@@ -39,3 +39,33 @@ def cutout(img: np.ndarray) -> Optional[np.ndarray]:
         return np.asarray(out.convert("RGBA"), dtype=np.float32) / 255.0
     except Exception:
         return None
+
+
+def reframe_foreground(rgba: np.ndarray, ratio: float = 0.85,
+                       size: int = 512) -> np.ndarray:
+    """Recenter+rescale the cutout so the subject occupies ``ratio`` of a square
+    canvas with even margin — TripoSR's expected framing. Reconstruction quality
+    is very sensitive to this: a frame-filling or off-center subject (common with
+    SD product-shot crops) yields a deformed volume. Returns [size,size,4] RGBA.
+
+    The subject's own aspect ratio is preserved; the longer side is scaled to
+    ``ratio*size`` and the result is centered, so a frame-filling apple becomes a
+    smaller, fully-visible, centered apple.
+    """
+    a = rgba[..., 3]
+    ys, xs = np.where(a > 0.1)
+    if ys.size < 16:                       # nothing segmented — leave as-is
+        return rgba
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    crop = rgba[y0:y1, x0:x1]
+    h, w = crop.shape[:2]
+    from PIL import Image
+    scale = (ratio * size) / max(h, w)
+    nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+    pil = Image.fromarray((np.clip(crop, 0, 1) * 255).astype(np.uint8), "RGBA")
+    pil = pil.resize((nw, nh), Image.LANCZOS)
+    small = np.asarray(pil, np.float32) / 255.0
+    canvas = np.zeros((size, size, 4), np.float32)
+    oy, ox = (size - nh) // 2, (size - nw) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = small
+    return canvas

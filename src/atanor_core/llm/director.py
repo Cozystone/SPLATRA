@@ -31,21 +31,28 @@ import re
 from typing import Any, Dict, List, Optional
 
 _SYS = (
-    "You are a 3D explainer. A particle model of the subject is on screen and YOU "
-    "decide how to manipulate it to teach. Output ONLY JSON: a list of 5-9 steps, "
-    "each {{\"say\":\"<short phrase in {lang}>\",\"action\":{{...}}}}. Compose the "
-    "actions freely — pick whatever explains '{topic}' best:\n"
-    "- focus {{\"type\":\"focus\",\"yaw\":<rad>,\"pitch\":<rad>,\"dist\":<2.2..3.6>,\"ms\":1200}} rotate/zoom to a part\n"
-    "- spin {{\"type\":\"spin\",\"ms\":1600}} slow turntable\n"
-    "- scale {{\"type\":\"scale\",\"to\":<0.3..1.8>,\"ms\":900}} shrink/grow to compare or zoom out\n"
-    "- arrow {{\"type\":\"arrow\",\"from\":[x,y,z],\"to\":[x,y,z],\"ms\":3000}} point at a part, or show a force / flow / direction in the air\n"
-    "- label {{\"type\":\"label\",\"at\":[x,y,z],\"text\":\"<short>\",\"ms\":3500}} name a feature\n"
-    "- charge {{\"type\":\"charge\",\"center\":[x,y,z],\"ms\":1500}} & discharge {{\"type\":\"discharge\",\"center\":[x,y,z],\"ms\":700}} energy / force / emission effect\n"
-    "- pulse {{\"type\":\"pulse\",\"ms\":600}}, none.\n"
-    "Coordinates are points in the model's [-1,1] cube. Make each short phrase line "
-    "up with its visual so it plays like a live lecture. Be specific to the subject "
-    "(use arrows for forces in physics, labels for parts in anatomy/architecture, "
-    "scale to compare, focus to inspect). Explain: {topic}"
+    "You are a 3D explainer that BUILDS A SCENE out of particle models and narrates "
+    "it. Output ONLY JSON: a list of 5-12 steps, each "
+    "{{\"say\":\"<short phrase in {lang}>\",\"action\":{{...}}}}. You compose the "
+    "whole scene freely to teach '{topic}'. Start by SPAWNING the object(s) you "
+    "need, placed apart in the world (the world spans about [-2,2]); then narrate, "
+    "move things, point and label. Actions:\n"
+    "- spawn {{\"type\":\"spawn\",\"prompt\":\"<a single concrete object, in English>\",\"id\":\"<short name>\",\"at\":[x,y,z],\"scale\":<0.3..1.0>}} create a 3D object at a spot\n"
+    "- move {{\"type\":\"move\",\"id\":\"<name>\",\"to\":[x,y,z],\"ms\":1200}} move/animate an object (e.g. something falling)\n"
+    "- focus {{\"type\":\"focus\",\"yaw\":<rad>,\"pitch\":<rad>,\"dist\":<3..6>,\"ms\":1200}} rotate/zoom the camera\n"
+    "- arrow {{\"type\":\"arrow\",\"from\":[x,y,z],\"to\":[x,y,z],\"ms\":3000}} point, or show a force/flow/direction in the air\n"
+    "- label {{\"type\":\"label\",\"at\":[x,y,z],\"text\":\"<short>\",\"ms\":3500}} name something\n"
+    "- scale {{\"type\":\"scale\",\"to\":<0.3..1.8>,\"ms\":900}}, spin {{\"type\":\"spin\",\"ms\":1600}}, "
+    "charge/discharge {{\"type\":\"charge\",\"center\":[x,y,z],\"ms\":1500}} energy FX, pulse, none.\n"
+    "- animate {{\"type\":\"animate\",\"style\":\"breathe|sway|bounce|float|jelly|wave|spin|walk|handwave|stop\",\"ms\":3000}} "
+    "make the model move (breathe=living thing, sway=plant/tree, bounce/jelly=soft/playful, "
+    "float=light/floating, wave=water/flag, walk=a person/animal walking with swinging "
+    "limbs, handwave=a character waving hello) — bring an object to life as you describe it.\n"
+    "Example — gravity: spawn a tree at [-0.8,0,0]; spawn an apple in its branches "
+    "at [-0.6,0.6,0]; spawn a person under it at [-0.6,-0.8,0]; then move the apple "
+    "down onto the person's head and add a downward arrow for the force. For a "
+    "single-object topic, just spawn it once and inspect it with focus/arrow/label. "
+    "Make each short phrase line up with its visual. Explain: {topic}"
 )
 
 
@@ -89,9 +96,11 @@ def _heuristic_script(topic: str, lang: str) -> List[Dict[str, Any]]:
     words = re.sub(r"[.,!?·]", " ", topic).split()
     phrases = [" ".join(words[i:i + 2]) for i in range(0, len(words), 2)] or [topic]
     spin = [{"type": "spin", "ms": 1400}, {"type": "pulse", "ms": 700},
-            {"type": "focus", "yaw": 0.6, "pitch": 0.3, "dist": 3.0, "ms": 1200}]
-    out = []
-    for i, p in enumerate(phrases):
+            {"type": "focus", "yaw": 0.6, "pitch": 0.3, "dist": 3.2, "ms": 1200}]
+    # first: spawn the subject (the LLM does richer scenes; this is the fallback)
+    out = [{"say": phrases[0], "action": {"type": "spawn", "prompt": topic,
+            "id": "obj", "at": [0, 0, 0], "scale": 1.0}}]
+    for i, p in enumerate(phrases[1:]):
         if any(k in p for k in ("전기", "스파크", "번개", "spark", "electric", "lightning", "energy", "에너지")):
             a = {"type": "charge", "center": _TAIL, "ms": 1500}
         elif any(k in p for k in ("방출", "발사", "폭발", "쏘", "discharge", "release", "emit", "blast", "fire")):

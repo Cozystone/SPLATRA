@@ -73,12 +73,15 @@ class TripoSRGenerator:
         torch = self._torch
         from PIL import Image
 
-        from .bg import cutout
+        from .bg import cutout, reframe_foreground
 
         rgba = cutout(image_rgb)
         if rgba is None:
             rgba = image_rgb if image_rgb.shape[-1] == 4 else np.concatenate(
                 [image_rgb, np.ones_like(image_rgb[..., :1])], -1)
+        # Recenter+rescale to TripoSR's expected framing (subject ~85% of frame,
+        # centered) — frame-filling/cropped SD shots otherwise deform the volume.
+        rgba = reframe_foreground(rgba, ratio=0.85, size=512)
         comp = rgba[..., :3] * rgba[..., 3:4] + 0.5 * (1 - rgba[..., 3:4])  # gray bg
         img = Image.fromarray((np.clip(comp, 0, 1) * 255).astype(np.uint8))
 
@@ -99,6 +102,9 @@ class TripoSRGenerator:
                               for ch in kpts.split(262144)]).clamp(0, 1)
             kpts = kpts.detach().cpu().numpy()
             colors = cols.detach().cpu().numpy()
+
+        if os.environ.get("SPLATRA_CLEAN") == "1":   # opt-in: adds ~0.5s/gen
+            kpts, colors = self._remove_floaters(kpts, colors)
 
         if kpts.shape[0] > self.n_points:
             s = np.random.default_rng(0).choice(kpts.shape[0], self.n_points, replace=False)
@@ -121,6 +127,31 @@ class TripoSRGenerator:
         sh = np.zeros((n, k, 3), np.float32)
         sh[:, 0, :] = rgb_to_sh_dc(colors.astype(np.float32))
         return GaussianField(means, scales, quats, opacities, sh, sh_degree=self.sh_degree)
+
+    def _remove_floaters(self, pts: np.ndarray, cols: np.ndarray,
+                         min_neighbors: int = 4) -> tuple:
+        """Drop isolated stray points (faint boundary 'floaters') that make the
+        cloud look fuzzy. Voxelize at the sampling resolution and keep only points
+        whose 3x3x3 voxel neighborhood holds >= min_neighbors occupied cells — a
+        conservative O(N) filter (27 array rolls) that leaves solid surfaces and
+        even thin sheets intact while removing specks."""
+        if pts.shape[0] < 1000:
+            return pts, cols
+        K = self.grid
+        lo = pts.min(0)
+        span = float((pts.max(0) - lo).max()) + 1e-9
+        vox = np.clip(np.floor((pts - lo) / span * K).astype(np.int64), 0, K - 1) + 1
+        occ = np.zeros((K + 2, K + 2, K + 2), bool)
+        occ[vox[:, 0], vox[:, 1], vox[:, 2]] = True
+        cnt = np.zeros_like(occ, np.int16)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    cnt += np.roll(np.roll(np.roll(occ, dx, 0), dy, 1), dz, 2)
+        keep = cnt[vox[:, 0], vox[:, 1], vox[:, 2]] >= min_neighbors
+        if keep.sum() < pts.shape[0] * 0.5:      # never nuke more than half (safety)
+            return pts, cols
+        return pts[keep], cols[keep]
 
     def generate(self, prompt: str) -> GaussianField:
         if self._t2i is None:

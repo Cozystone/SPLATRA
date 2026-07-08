@@ -17,9 +17,11 @@ Run::
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import struct
+import threading
 import time
 import uuid
 import zlib
@@ -65,6 +67,18 @@ _mv_gen = None  # lazy singleton
 _USE_TRIPOSR = os.environ.get("SPLATRA_TRIPOSR", "0") == "1"
 _triposr_gen = None  # lazy singleton
 
+if _USE_SD or _USE_MV or _USE_TRIPOSR:
+    # diffusers must be imported on the MAIN thread: FastAPI runs sync tool
+    # calls in a worker thread, where the lazy diffusers import partially
+    # initializes and then fails (measured under uvicorn only:
+    # "cannot import name 'AutoPipelineForText2Image'" while the same import
+    # succeeds in a plain main-thread process). Warming it here also removes
+    # the first-request pipeline-load latency.
+    try:
+        from diffusers import AutoPipelineForText2Image as _warm_t2i  # noqa: F401
+    except Exception:
+        pass
+
 
 def _triposr():
     global _triposr_gen
@@ -72,6 +86,9 @@ def _triposr():
         from atanor_core.generation.triposr import TripoSRGenerator
 
         _triposr_gen = TripoSRGenerator()
+        # Share the one text->image pipeline (SDXL ~7GB) instead of letting TripoSR
+        # spin up its own second copy — two SDXL pipelines won't fit in 16GB.
+        _triposr_gen._t2i = _sd()
     return _triposr_gen
 
 
@@ -120,11 +137,33 @@ def _prewarm_models() -> None:
                 _triposr()._ensure()     # TripoSR triplane model
             elif _USE_MV:
                 _mv()._ensure()          # Zero123++
+            # one throwaway FULL-pipeline gen so cuDNN autotuning for BOTH SDXL and
+            # TripoSR is paid here, not on the user's first request (that first-run
+            # cost is the ~25s "first generation is slow" spike).
+            try:
+                _gen_object("a gray sphere")
+            except Exception:
+                try:
+                    _sd().warmup()
+                except Exception:
+                    pass
         except Exception:
             pass
 
+    # Resolve diffusers' lazy module + load models entirely in the warm thread so
+    # the HTTP server binds immediately (doing it synchronously here delayed the
+    # bind by ~30-60s). The concurrent-import race is handled by the load lock in
+    # TextTo3DGenerator._ensure, so a request arriving early is safe.
+    def warm_all():
+        try:
+            import diffusers
+            diffusers.AutoPipelineForText2Image  # noqa: B018 — force lazy resolution
+        except Exception:
+            pass
+        warm()
+
     import threading
-    threading.Thread(target=warm, daemon=True).start()
+    threading.Thread(target=warm_all, daemon=True).start()
 
 _VIEWER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer")
 
@@ -134,6 +173,41 @@ _VIEWER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 _engine = build_default_engine(gen_points=40000)
 _jobs: Dict[str, Dict[str, Any]] = {}
 _viewer_sockets: List["WebSocket"] = []
+_REAL_JOB_MAX_SECONDS = float(os.environ.get("SPLATRA_REAL_JOB_MAX_SECONDS", "180"))
+
+
+def _run_real_generation_job(job_id: str, name: str, prompt: str, quality: str) -> None:
+    try:
+        _jobs[job_id].update({"phase": "generating", "worker_started_at": time.time()})
+        field, tag = _gen_object(prompt)
+        if _jobs[job_id].get("cancelled"):
+            return
+        _jobs[job_id].update({"phase": "displaying"})
+        _display_field(name, field)
+        _jobs[job_id].update({
+            "done": True,
+            "cache": "real_generator",
+            "shape": f"{tag}:{quality}",
+            "sgf": _sgf_summary(field),
+            "verified": True,
+            "hot_swap": True,
+            "error": None,
+            "phase": "complete",
+            "finished_at": time.time(),
+        })
+    except Exception as exc:
+        if _jobs[job_id].get("cancelled"):
+            return
+        _jobs[job_id].update({
+            "done": True,
+            "cache": "real_generator_failed",
+            "shape": f"real_generator_failed:{type(exc).__name__}",
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            "verified": False,
+            "hot_swap": False,
+            "phase": "failed",
+            "finished_at": time.time(),
+        })
 _heuristic = HeuristicLLM()
 
 # Always have something on screen for the first frame.
@@ -207,6 +281,111 @@ OPENAI_TOOLS = [
             },
         },
     },
+    # ── scene-authoring tools: build a multi-object 3D explanation as you talk ──
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_object",
+            "description": (
+                "Add a 3D object to the shared explanation scene (many objects "
+                "coexist). Give it a short id so you can place/link it later. "
+                "Position is optional — omit it to auto-place on a ring."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "the object, in English"},
+                    "id": {"type": "string", "description": "short handle, e.g. 'sun'"},
+                    "position": {"type": "array", "items": {"type": "number"},
+                                 "description": "[x,y,z] world position (optional)"},
+                    "label": {"type": "string", "description": "floating caption (optional)"},
+                    "scale": {"type": "number"},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_object",
+            "description": "Move an existing scene object to a world position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "position": {"type": "array", "items": {"type": "number"}},
+                },
+                "required": ["id", "position"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "link_objects",
+            "description": "Draw a particle-strand link (relation/arrow) between two scene objects.",
+            "parameters": {
+                "type": "object",
+                "properties": {"src": {"type": "string"}, "dst": {"type": "string"}},
+                "required": ["src", "dst"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "label_object",
+            "description": "Set an object's floating caption.",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}, "text": {"type": "string"}},
+                "required": ["id", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_scene",
+            "description": "Remove all objects and start a fresh explanation scene.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explain_scene",
+            "description": (
+                "Build a WHOLE multi-object 3D explanation in one call: several "
+                "objects placed in a shared space, linked by relations. Use this "
+                "whenever the user asks to explain/compare/show more than one thing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objects": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string", "description": "object in English"},
+                                "id": {"type": "string", "description": "short handle"},
+                                "label": {"type": "string"},
+                            },
+                            "required": ["prompt"],
+                        },
+                    },
+                    "links": {
+                        "type": "array",
+                        "items": {"type": "array", "items": {"type": "string"}},
+                        "description": "pairs of ids to connect, e.g. [['sun','earth']]",
+                    },
+                },
+                "required": ["objects"],
+            },
+        },
+    },
 ]
 
 
@@ -261,7 +440,13 @@ def _sgf_summary(field: GaussianField) -> Dict[str, Any]:
 
 def _slug(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return s[:48] or "object"
+    if s:
+        return s[:48]
+    # Non-Latin prompts (피카츄/오리/우주선) all collapsed to the SAME "object"
+    # slug — cache entries and rig/parts lookups collided across different
+    # generations. A deterministic hash keeps each prompt its own identity.
+    import hashlib
+    return "obj-" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
 
 
 # Vivid named colors (honor "blue cube", "red torus", incl. common Korean).
@@ -373,12 +558,14 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 auto = None
                 if _USE_TRIPOSR:
-                    field = _triposr().generate(prompt); tag = "triposr→3d"
+                    field = _triposr().generate(prompt); tag = "triposr-3d"
                 elif _USE_MV:
-                    field = _mv().generate(prompt); tag = "multiview→3d"
+                    field = _mv().generate(prompt); tag = "multiview-3d"
                     auto = getattr(_mv(), "last_score", None)
                 else:
-                    field = _sd().generate(prompt); tag = "tiny-sd→3d"
+                    sd = _sd()
+                    model_name = str(getattr(sd, "model", "sd")).rstrip("/\\").split("/")[-1].split("\\")[-1] or "sd"
+                    field = sd.generate(prompt); tag = f"{model_name}-3d"
                 _display_field(obj, field)
                 rec = {"tool": name, "ok": True, "name": obj, "shape": tag,
                        "sgf": _sgf_summary(field), "verified": True, "hot_swap": True}
@@ -386,12 +573,33 @@ def _execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     rec["auto_score"] = auto      # silhouette-IoU quality 0-100
                 return rec
             except Exception as exc:
+                try:  # full chained traceback — the lazy diffusers loader masks root causes
+                    import traceback as _tb
+                    with open("gen_fail.log", "w", encoding="utf-8") as _f:
+                        _f.write(_tb.format_exc())
+                except Exception:
+                    pass
+                # QUALITY LADDER: TripoSR sometimes yields an empty volume for a
+                # prompt — fall to the SD silhouette lift (still the real object)
+                # before ever surrendering to a procedural sphere.
+                if _USE_SD and _USE_TRIPOSR:
+                    try:
+                        field = _sd().generate(prompt)
+                        _display_field(obj, field)
+                        return {"tool": name, "ok": True, "name": obj, "shape": "sd-fallback-3d",
+                                "sgf": _sgf_summary(field), "verified": True, "hot_swap": True}
+                    except Exception:
+                        pass
                 return {"tool": name, "ok": True, "name": obj,
-                        "shape": f"sphere (gen failed: {type(exc).__name__})",
+                        "shape": f"sphere (gen failed: {type(exc).__name__}: {str(exc)[:160]})",
                         **_gen_procedural(obj, prompt, "sphere")}
 
         shape = explicit_shape or "sphere"
         return {"tool": name, "name": obj, "shape": shape, **_gen_procedural(obj, prompt, shape)}
+
+    if name in ("spawn_object", "place_object", "link_objects", "label_object",
+                "clear_scene", "explain_scene"):
+        return _scene_tool(name, args)
 
     return {"tool": name, "ok": False, "error": "unknown tool"}
 
@@ -532,6 +740,18 @@ def _cartridge_arrays():
             np.concatenate(Q, 0), np.concatenate(O, 0))
 
 
+def _apply_cartridge_budget(pos, col, scale, quat, opa, budget: Optional[int] = None):
+    """Return an importance-sampled cartridge view without mutating the source arrays."""
+    n = int(pos.shape[0])
+    if budget is None or budget <= 0 or budget >= n:
+        return pos, col, scale, quat, opa
+    k = max(1, int(budget))
+    importance = np.asarray(opa, np.float32) * np.max(np.asarray(scale, np.float32), axis=1)
+    chosen = np.argpartition(importance, -k)[-k:]
+    chosen.sort()
+    return pos[chosen], col[chosen], scale[chosen], quat[chosen], opa[chosen]
+
+
 def _pack_cartridge(pos, col, scale, quat, opa) -> bytes:
     # magic "SPL2" + uint32 N, then pos[N*3] col[N*3] scale[N*3] quat[N*4] opa[N]
     n = int(pos.shape[0])
@@ -546,13 +766,63 @@ def _pack_cartridge(pos, col, scale, quat, opa) -> bytes:
     )
 
 
+def _pack_cartridge_spl3(pos, col, scale, quat, opa) -> bytes:
+    """Pack a quantized SPL3 cartridge.
+
+    Layout:
+      magic "SPL3", uint32 N, bbox_min[3] fp32, bbox_max[3] fp32,
+      position int16x3 bbox-normalized, color uint8x3, scale fp16x3,
+      quaternion int8x4 snorm, opacity uint8.
+    """
+    n = int(pos.shape[0])
+    pos = np.ascontiguousarray(pos, np.float32)
+    col = np.ascontiguousarray(np.clip(col, 0.0, 1.0), np.float32)
+    scale = np.ascontiguousarray(np.maximum(scale, 0.0), np.float32)
+    quat = np.ascontiguousarray(quat, np.float32)
+    opa = np.ascontiguousarray(np.clip(opa, 0.0, 1.0), np.float32)
+
+    bbox_min = pos.min(axis=0).astype(np.float32) if n else np.zeros(3, np.float32)
+    bbox_max = pos.max(axis=0).astype(np.float32) if n else np.ones(3, np.float32)
+    span = np.maximum(bbox_max - bbox_min, np.float32(1e-8))
+    pos_q = np.rint(((pos - bbox_min) / span) * 65535.0 - 32768.0)
+    pos_q = np.clip(pos_q, -32768, 32767).astype("<i2", copy=False)
+
+    col_q = np.rint(col * 255.0).astype(np.uint8, copy=False)
+    scale_q = scale.astype("<f2", copy=False)
+    q_norm = np.linalg.norm(quat, axis=1, keepdims=True)
+    q_norm = np.where(q_norm > 1e-8, q_norm, 1.0).astype(np.float32)
+    quat_q = np.rint(np.clip(quat / q_norm, -1.0, 1.0) * 127.0).astype(np.int8, copy=False)
+    opa_q = np.rint(opa * 255.0).astype(np.uint8, copy=False)
+
+    return (
+        b"SPL3"
+        + struct.pack("<I", n)
+        + bbox_min.astype("<f4", copy=False).tobytes()
+        + bbox_max.astype("<f4", copy=False).tobytes()
+        + np.ascontiguousarray(pos_q).tobytes()
+        + np.ascontiguousarray(col_q).tobytes()
+        + np.ascontiguousarray(scale_q).tobytes()
+        + np.ascontiguousarray(quat_q).tobytes()
+        + np.ascontiguousarray(opa_q).tobytes()
+    )
+
+
 @app.get("/v1/cartridge")
-def cartridge() -> Response:
+def cartridge(format: str = "spl2", budget: Optional[int] = None) -> Response:
     if _engine.field is None:
         raise HTTPException(status_code=409, detail="nothing rendered yet")
-    blob = _pack_cartridge(*_cartridge_arrays())
+    arrays = _apply_cartridge_budget(*_cartridge_arrays(), budget=budget)
+    fmt = format.lower().strip()
+    if fmt == "spl3":
+        blob = _pack_cartridge_spl3(*arrays)
+        out_format = "SPL3"
+    elif fmt == "spl2":
+        blob = _pack_cartridge(*arrays)
+        out_format = "SPL2"
+    else:
+        raise HTTPException(status_code=400, detail="format must be spl2 or spl3")
     return Response(content=blob, media_type="application/octet-stream",
-                    headers={"Cache-Control": "no-store"})
+                    headers={"Cache-Control": "no-store", "X-SPLATRA-Format": out_format})
 
 
 # --------------------------------------------------------------------------- #
@@ -593,6 +863,444 @@ def _display_field(name: str, field: GaussianField, verified: bool = True) -> No
     cart.verified = verified
     _engine.cache[name] = cart
     _engine.state = HoloState.DISPLAYED
+
+
+# ── multi-object explainer scene (REALTIME_EXPLAINER pillar 1) ────────────────
+# Many objects coexist in ONE world — placed apart, linked, labelled — and the
+# whole scene composites (Scene.flatten) into the single field the renderer +
+# viewer already draw. This is the foundation the LLM authoring loop drives.
+_scene = None  # type: ignore[var-annotated]
+
+
+def _field_for_prompt(prompt: str) -> GaussianField:
+    """A GaussianField for one prompt — realistic (TripoSR/MV/SD) when enabled and
+    the word isn't a known primitive, else a procedural shape. Returns the field
+    WITHOUT displaying it, so many can be composited into a scene."""
+    shape = next((s for w, s in _SHAPE_WORDS.items() if w in prompt.lower()), None)
+    if shape is None and (_USE_TRIPOSR or _USE_MV or _USE_SD):
+        try:
+            if _USE_TRIPOSR:
+                return _triposr().generate(prompt)
+            if _USE_MV:
+                return _mv().generate(prompt)
+            return _sd().generate(prompt)
+        except Exception:
+            pass
+    _gen_procedural(_slug(prompt), prompt, shape or "sphere")
+    return _engine.field.copy()
+
+
+def _rerender_scene() -> int:
+    """Composite the current scene and hot-swap it into the renderer."""
+    global _scene
+    if _scene is not None and _scene.objects:
+        _display_field("scene", _scene.flatten())
+        return _scene.version
+    return 0
+
+
+def _scene_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """LLM scene-authoring: spawn/place/link/label/clear mutate the shared scene
+    and re-render, so the explanation GROWS as the model talks."""
+    from atanor_core.domain.scene import Scene, SceneObject
+
+    global _scene
+    if _scene is None:
+        _scene = Scene()
+
+    if name == "clear_scene":
+        _scene = Scene()
+        _engine.field = None
+        return {"tool": name, "ok": True, "version": 0}
+
+    if name == "explain_scene":
+        # whole multi-object explanation in one call (the LLM's preferred path)
+        _scene = Scene()
+        objs = args.get("objects") or []
+        for i, o in enumerate(objs):
+            prompt = str(o.get("prompt", "object"))
+            oid = _slug(str(o.get("id") or prompt)) or f"obj{i}"
+            f = _field_for_prompt(prompt).copy()
+            f.means = (f.means - f.means.mean(axis=0)).astype(np.float32)
+            so = SceneObject(id=oid, field=f, scale=float(o.get("scale", 1.0) or 1.0),
+                             label=o.get("label"))
+            pos = o.get("position")
+            if isinstance(pos, (list, tuple)) and len(pos) == 3:
+                so.position = np.asarray(pos, np.float32)
+            elif len(objs) > 1:
+                a = 2 * np.pi * i / max(1, len(objs))
+                so.position = np.array([2.3 * np.cos(a), 0.0, 2.3 * np.sin(a)], np.float32)
+            _scene.add(so)
+        for link in (args.get("links") or []):
+            if isinstance(link, (list, tuple)) and len(link) >= 2:
+                s, d = _slug(str(link[0])), _slug(str(link[1]))
+                if s in _scene.objects and d in _scene.objects:
+                    _scene.link(s, d)
+        return {"tool": name, "ok": True, "objects": list(_scene.objects),
+                "links": len(_scene.links), "version": _rerender_scene()}
+
+    if name == "spawn_object":
+        prompt = str(args.get("prompt", "object"))
+        oid = _slug(str(args.get("id") or prompt)) or f"obj{len(_scene.objects)}"
+        f = _field_for_prompt(prompt).copy()
+        f.means = (f.means - f.means.mean(axis=0)).astype(np.float32)
+        so = SceneObject(id=oid, field=f, scale=float(args.get("scale", 1.0) or 1.0),
+                         label=args.get("label"))
+        pos = args.get("position")
+        if isinstance(pos, (list, tuple)) and len(pos) == 3:
+            so.position = np.asarray(pos, np.float32)
+        else:
+            i = len(_scene.objects)
+            a = 2 * np.pi * i / max(1, i + 1)
+            so.position = np.array([2.3 * np.cos(a), 0.0, 2.3 * np.sin(a)], np.float32)
+        _scene.add(so)
+        return {"tool": name, "ok": True, "id": oid,
+                "position": [round(float(x), 2) for x in so.position],
+                "version": _rerender_scene(), "objects": list(_scene.objects)}
+
+    if name == "place_object":
+        oid = _slug(str(args.get("id", "")))
+        pos = args.get("position")
+        if oid in _scene.objects and isinstance(pos, (list, tuple)) and len(pos) == 3:
+            _scene.move(oid, pos)
+            return {"tool": name, "ok": True, "id": oid, "version": _rerender_scene()}
+        return {"tool": name, "ok": False, "error": "unknown id or bad position"}
+
+    if name == "link_objects":
+        s, d = _slug(str(args.get("src", ""))), _slug(str(args.get("dst", "")))
+        if s in _scene.objects and d in _scene.objects:
+            _scene.link(s, d)
+            return {"tool": name, "ok": True, "src": s, "dst": d, "version": _rerender_scene()}
+        return {"tool": name, "ok": False, "error": "unknown src/dst"}
+
+    if name == "label_object":
+        oid = _slug(str(args.get("id", "")))
+        if oid in _scene.objects:
+            _scene.objects[oid].label = str(args.get("text", ""))
+            _scene.version += 1
+            return {"tool": name, "ok": True, "id": oid}
+        return {"tool": name, "ok": False, "error": "unknown id"}
+
+    return {"tool": name, "ok": False, "error": "unknown scene tool"}
+
+
+class ExplainObject(BaseModel):
+    id: Optional[str] = None
+    prompt: str
+    position: Optional[List[float]] = None
+    scale: float = 1.0
+    label: Optional[str] = None
+
+
+class ExplainRequest(BaseModel):
+    objects: List[ExplainObject]
+    links: List[List[Any]] = []          # [src, dst] or [src, dst, {style}]
+    clear: bool = True
+
+
+@app.post("/v1/explain")
+def explain(req: ExplainRequest) -> Dict[str, Any]:
+    """Build a multi-object 3D explanation: generate each object, place them in one
+    world (explicit position or auto-ring), link them, and render the composite."""
+    from atanor_core.domain.scene import Scene, SceneObject
+
+    global _scene
+    if req.clear or _scene is None:
+        _scene = Scene()
+    n = max(1, len(req.objects))
+    used_ids: List[str] = []
+    for i, o in enumerate(req.objects):
+        oid = (o.id or _slug(o.prompt) or f"obj{i}")
+        f = _field_for_prompt(o.prompt).copy()
+        f.means = (f.means - f.means.mean(axis=0)).astype(np.float32)  # object-local center
+        so = SceneObject(id=oid, field=f, scale=float(o.scale), label=o.label)
+        if o.position is not None and len(o.position) == 3:
+            so.position = np.asarray(o.position, np.float32)
+        elif n > 1:
+            a = 2 * np.pi * i / n
+            so.position = np.array([2.3 * np.cos(a), 0.0, 2.3 * np.sin(a)], np.float32)
+        _scene.add(so)
+        used_ids.append(oid)
+    for link in req.links:
+        if len(link) >= 2:
+            style = link[2] if len(link) > 2 and isinstance(link[2], dict) else {}
+            _scene.link(str(link[0]), str(link[1]), **style)
+    field = _scene.flatten()
+    _display_field("explain", field)
+    return {
+        "ok": True,
+        "objects": [{"id": oid, "label": _scene.objects[oid].label,
+                     "position": [round(float(x), 2) for x in _scene.objects[oid].position]}
+                    for oid in used_ids],
+        "links": len(_scene.links),
+        "n_particles": int(field.num_gaussians),
+        "version": _scene.version,
+    }
+
+
+@app.post("/v1/explain/clear")
+def explain_clear() -> Dict[str, Any]:
+    global _scene
+    from atanor_core.domain.scene import Scene
+
+    _scene = Scene()
+    return {"ok": True, "version": 0}
+
+
+# ── learned live rig: predicted joints -> FK pose -> PBD soft-body ───────────
+# The generated shell gets a LEARNED skeleton (rig_predictor finds the internal
+# joints), pose_chain articulates it, PBD adds flesh. ATANOR drives per-joint
+# intents through these endpoints.
+_RIG_WEIGHTS = os.path.join(os.path.dirname(__file__), "..", "data", "rig_predictor_v1.pt")
+_live_rig: Dict[str, Any] = {"key": None}
+
+
+def _rig_for_current_field() -> Dict[str, Any]:
+    from atanor_core.rigging.live_rig import bind_joints, predict_rig_joints
+    from atanor_core.rigging.rig_predictor import RigPredictor
+    from atanor_core.motion.pbd import SoftBody
+
+    if _engine.field is None:
+        raise HTTPException(status_code=409, detail="nothing rendered yet")
+    f = _engine.field
+    key = (int(f.num_gaussians), float(f.means[0, 0]), float(f.means[-1, 2]))
+    if _live_rig.get("key") == key:
+        return _live_rig
+    if not os.path.exists(_RIG_WEIGHTS):
+        raise HTTPException(status_code=503, detail="rig predictor weights missing "
+                                                    "(train via rigging/rig_predictor)")
+    predictor = RigPredictor.load(_RIG_WEIGHTS)
+    home = f.means.copy()
+    joints = predict_rig_joints(home, predictor)
+    if len(joints) == 0:
+        raise HTTPException(status_code=422, detail="no joints found on this shape")
+    _live_rig.update({
+        "key": key, "home": home, "joints": joints,
+        "rig": bind_joints(home, joints), "soft": SoftBody(home),
+    })
+    return _live_rig
+
+
+def _auto_chain(rig) -> List[int]:
+    """Default drive target: the chain of joints extending farthest out in one
+    direction from the body (on a creature that's the tail / dominant limb)."""
+    d = np.linalg.norm(rig.joints - rig.centroid, axis=1)
+    seed = int(d.argmax())
+    seed_dir = rig.outward[seed]
+    return [j for j in range(len(rig.joints))
+            if float(rig.outward[j] @ seed_dir) > 0.6 and d[j] > 0.25 * d[seed]]
+
+
+class RigAnimateRequest(BaseModel):
+    drive: float = 0.6
+    chain: Optional[List[int]] = None    # joint indices; None = auto (outermost chain)
+    frames: int = 5                      # PBD frames toward the pose (lag/jiggle)
+    reset: bool = False
+
+
+@app.get("/v1/rig")
+def rig_info() -> Dict[str, Any]:
+    lr = _rig_for_current_field()
+    rig = lr["rig"]
+    up = np.array([0.0, 1.0, 0.0], np.float32)
+    axes = []
+    for j in range(len(rig.joints)):
+        a = np.cross(rig.outward[j], up)
+        n = np.linalg.norm(a)
+        axes.append((a / n if n > 1e-4 else np.array([1.0, 0.0, 0.0])).tolist())
+    jd = np.linalg.norm(rig.joints[:, None, :] - rig.joints[None, :, :], axis=2)
+    jd[np.arange(len(jd)), np.arange(len(jd))] = np.inf
+    reach = float(np.median(jd.min(1))) if len(rig.joints) > 1 else 0.3
+    from atanor_core.rigging.live_rig import decompose_chains
+
+    return {
+        "ok": True,
+        "n_joints": len(lr["joints"]),
+        "joints": [[round(float(x), 4) for x in j] for j in lr["joints"]],
+        "axes": [[round(float(x), 4) for x in a] for a in axes],
+        "outward": [[round(float(x), 4) for x in o] for o in rig.outward],
+        "reach": round(reach, 4),
+        "centroid": [round(float(x), 4) for x in rig.centroid],
+        "chains": decompose_chains(rig),
+        "auto_chain": _auto_chain(rig),
+        "avatar": _embodiment["avatar"],
+        "articulating_particles": int((rig.weight > 0.3).sum()),
+        "softbody_constraints": int(lr["soft"].n_constraints),
+    }
+
+
+# The machine's emotion may show ONLY in its own character (the avatar). Fields
+# generated to explain things are plain objects: rigged, animatable, but never
+# mood-driven. Default: object.
+_embodiment = {"avatar": False}
+
+
+@app.post("/v1/embody")
+def embody(body: Dict[str, Any]) -> Dict[str, Any]:
+    _embodiment["avatar"] = bool(body.get("avatar", True))
+    return {"ok": True, "avatar": _embodiment["avatar"]}
+
+
+_ato_cache: Dict[str, Any] = {}
+
+
+def _ato_field() -> GaussianField:
+    """Ato is deterministic — build ONCE, then every summon is a memcopy.
+    This is the instant-summon contract: no rebuild, no re-generation."""
+    if "arrays" not in _ato_cache:
+        from atanor_core.avatar.ato import build_ato
+
+        pos, col, scale, quat, opa = build_ato()
+        C0 = 0.28209479177387814
+        op = np.clip(opa, 1e-4, 1 - 1e-4)
+        _ato_cache["arrays"] = dict(
+            means=pos,
+            scales=np.log(np.maximum(scale, 1e-5)).astype(np.float32),
+            quats=quat,
+            opacities=np.log(op / (1 - op)).astype(np.float32),
+            sh=((np.clip(col, 0, 1) - 0.5) / C0)[:, None, :].astype(np.float32))
+    a = _ato_cache["arrays"]
+    return GaussianField(means=a["means"].copy(), scales=a["scales"],
+                         quats=a["quats"], opacities=a["opacities"],
+                         sh=a["sh"], sh_degree=0)
+
+
+@app.post("/v1/avatar")
+def summon_avatar(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Summon 아토 (Ato) — the machine's own character. Cached-instant after
+    first build; marks the field as the AVATAR so the live self's hormones may
+    drive its gestures (and ONLY its gestures — Ato never melts)."""
+    t0 = time.time()
+    field = _ato_field()
+    _display_field("ato", field)
+    _embodiment["avatar"] = True
+    return {"ok": True, "name": "ato", "n": int(field.num_gaussians),
+            "avatar": True, "summon_ms": round((time.time() - t0) * 1000, 1)}
+
+
+_parts_cache: Dict[str, Any] = {"key": None}
+
+
+@app.get("/v1/parts")
+def parts_info() -> Dict[str, Any]:
+    """Semantic micro-parts of the CURRENT field (eyes for now) — shape-agnostic
+    color-contrast detection; abstains on shapes without such structure."""
+    from atanor_core.rigging.parts import find_eyes
+
+    if _engine.field is None:
+        raise HTTPException(status_code=409, detail="nothing rendered yet")
+    if _engine._edges:
+        return {"ok": True, "eyes": []}      # a graph has nodes, not a face
+    f = _engine.field
+    key = (int(f.num_gaussians), float(f.means[0, 0]))
+    if _parts_cache.get("key") != key:
+        cols = np.clip(sh_dc_to_rgb(f.sh[:, 0, :]), 0.0, 1.0)
+        _parts_cache.update({"key": key, "eyes": find_eyes(f.means, cols)})
+    return {"ok": True, "eyes": _parts_cache["eyes"]}
+
+
+@app.post("/v1/dev/load_sample")
+def dev_load_sample(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Dev helper: load a viewer sample cartridge into the ENGINE so server-side
+    endpoints (/v1/rig, /v1/cartridge, /v1/rig_mood) operate on it."""
+    from atanor_core.rigging.live_rig import load_spl2
+
+    name = re.sub(r"[^a-z0-9_]", "", str(body.get("name", "pikachu")).lower())
+    path = os.path.join(os.path.dirname(__file__), "..", "viewer", "samples", f"{name}.bin")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"no sample {name}")
+    pos, col, scale, quat, opa = load_spl2(path)
+    C0 = 0.28209479177387814
+    op = np.clip(opa, 1e-4, 1 - 1e-4)
+    field = GaussianField(
+        means=pos.astype(np.float32),
+        scales=np.log(np.maximum(scale, 1e-5)).astype(np.float32),
+        quats=quat.astype(np.float32),
+        opacities=np.log(op / (1 - op)).astype(np.float32),
+        sh=((np.clip(col, 0, 1) - 0.5) / C0)[:, None, :].astype(np.float32),
+        sh_degree=0)
+    _display_field(name, field)
+    return {"ok": True, "name": name, "n": int(field.num_gaussians)}
+
+
+_ATANOR_SELF_URL = os.environ.get("ATANOR_SELF_URL",
+                                  "http://127.0.0.1:8502/api/selfhood/live")
+_self_state_cache: Dict[str, Any] = {"state": None, "at": 0.0}
+
+
+class RigMoodRequest(BaseModel):
+    state: Optional[Dict[str, Any]] = None   # selfhood snapshot; None = fetch live
+    t: Optional[float] = None
+    frames: int = 5
+    dry: bool = False                        # True: return params only, no pose
+
+
+@app.post("/v1/rig_mood")
+def rig_mood(req: RigMoodRequest) -> Dict[str, Any]:
+    """ATANOR's inner state drives the body: hormones/vitals -> motion params ->
+    per-joint intents on the predicted rig. The bridge from feeling to gesture."""
+    from atanor_core.rigging.live_rig import pose_joints
+    from atanor_core.rigging.mood_drive import chain_drives, motion_params
+
+    state = req.state
+    if state is None:
+        now_t = time.time()
+        cached = _self_state_cache.get("state")
+        if cached is not None and now_t - _self_state_cache["at"] < 2.0:
+            state = cached                    # poll bursts must not stack
+        else:
+            try:
+                import urllib.request
+
+                with urllib.request.urlopen(_ATANOR_SELF_URL, timeout=3) as r:
+                    state = json.loads(r.read().decode("utf-8"))
+                _self_state_cache.update({"state": state, "at": now_t})
+            except Exception as e:
+                raise HTTPException(status_code=503,
+                                    detail=f"no state given and ATANOR live state "
+                                           f"unreachable: {e}")
+    params = motion_params(state)
+    hormones = ((state.get("homeostasis") or {}).get("hormones")
+                or state.get("hormones") or {})
+    if req.dry:
+        return {"ok": True, "params": params, "hormones": hormones}
+    lr = _rig_for_current_field()
+    rig, soft, home = lr["rig"], lr["soft"], lr["home"]
+    t = float(req.t) if req.t is not None else time.time() % 10000.0
+    intents = chain_drives(params, list(range(len(lr["joints"]))), t)
+    target = pose_joints(home, rig, amp=0.0, intents=intents)
+    x = soft.settle(target, frames=max(1, min(int(req.frames), 60)))
+    f = _engine.field
+    f.means = x.astype(np.float32)
+    _display_field("rigged", f)
+    _live_rig["key"] = (int(f.num_gaussians), float(f.means[0, 0]), float(f.means[-1, 2]))
+    mv = np.linalg.norm(x - home, axis=1)
+    return {"ok": True, "params": params, "hormones": hormones,
+            "moved_mean": round(float(mv.mean()), 4),
+            "moved_max": round(float(mv.max()), 3)}
+
+
+@app.post("/v1/rig_animate")
+def rig_animate(req: RigAnimateRequest) -> Dict[str, Any]:
+    from atanor_core.rigging.live_rig import pose_chain
+
+    lr = _rig_for_current_field()
+    rig, soft, home = lr["rig"], lr["soft"], lr["home"]
+    chain = req.chain if req.chain else _auto_chain(rig)
+    target = home if req.reset else pose_chain(home, rig, chain, float(req.drive))
+    x = soft.settle(target, frames=max(1, min(int(req.frames), 60)))
+    f = _engine.field
+    f.means = x.astype(np.float32)
+    _display_field("rigged", f)
+    # the field moved but it is still the SAME body: keep the cached rig bound to
+    # the original home/joints instead of re-predicting on the posed shape
+    _live_rig["key"] = (int(f.num_gaussians), float(f.means[0, 0]), float(f.means[-1, 2]))
+    mv = np.linalg.norm(x - home, axis=1)
+    return {
+        "ok": True, "chain": chain, "drive": float(req.drive),
+        "moved_mean": round(float(mv.mean()), 4), "moved_max": round(float(mv.max()), 3),
+        "pbd_lag": round(float(np.linalg.norm(x - target, axis=1).mean()), 4),
+    }
 
 
 def _image_to_field(name: str, img: Optional[np.ndarray]) -> Tuple[str, str, GaussianField]:
@@ -682,12 +1390,21 @@ async def generate_from_image(image: UploadFile = File(...)) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 def _gen_object(prompt: str):
     """(field, tag) for a text prompt using the best available generator."""
+    try:
+        from atanor_core.generation.materials import glass_orb_field, looks_like_glass_orb
+
+        if looks_like_glass_orb(prompt):
+            return glass_orb_field(), "real_generator_material_glass_orb"
+    except Exception:
+        pass
     if _USE_TRIPOSR:
-        return _triposr().generate(prompt), "triposr→3d"
+        return _triposr().generate(prompt), "triposr-3d"
     if _USE_MV:
-        return _mv().generate(prompt), "multiview→3d"
+        return _mv().generate(prompt), "multiview-3d"
     if _USE_SD:
-        return _sd().generate(prompt), "tiny-sd→3d"
+        sd = _sd()
+        model_name = str(getattr(sd, "model", "sd")).rstrip("/\\").split("/")[-1].split("\\")[-1] or "sd"
+        return sd.generate(prompt), f"{model_name}-3d"
     shape = detect_shape(prompt)
     return _engine.generator.generate(_prompt_to_mv(prompt), cam_rays={"shape": shape}), shape
 
@@ -701,16 +1418,14 @@ class NarrateRequest(BaseModel):
 
 @app.post("/v1/narrate")
 def narrate(req: NarrateRequest) -> Dict[str, Any]:
-    """Build the model, then return a time-synced narration script (say+action)
-    the browser plays with TTS while manipulating the particles (JARVIS mode)."""
+    """Return a time-synced narration SCRIPT. The script's spawn/move actions
+    build & animate a multi-object scene; the browser plays it (TTS + actions +
+    /v1/scene/* calls). The scene is cleared so the script starts fresh."""
     from atanor_core.llm.director import make_script
 
-    name = _slug(req.prompt)
-    field, tag = _gen_object(req.prompt)
-    _display_field(name, field)
+    _scene.objects.clear(); _scene.links.clear(); _scene.version += 1   # fresh scene
     d = make_script(req.topic or req.prompt, lang=req.lang, ollama_model=req.model)
-    return {"name": name, "engine": tag, "director": d["engine"],
-            "script": d["script"], "sgf": _sgf_summary(field)}
+    return {"director": d["engine"], "script": d["script"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -823,10 +1538,54 @@ def render_knowledge_hologram(req: RenderGraphRequest) -> Dict[str, Any]:
 @app.post("/v1/generate_3d_object")
 def generate_3d_object(req: GenerateRequest) -> Dict[str, Any]:
     name = _slug(req.prompt)
-    shape = req.shape or detect_shape(req.prompt)
+    material_glass_orb = False
+    try:
+        from atanor_core.generation.materials import looks_like_glass_orb
+
+        material_glass_orb = looks_like_glass_orb(req.prompt)
+    except Exception:
+        material_glass_orb = False
+    quality = (req.quality or "fast").lower().strip()
+    quality_wants_real = quality in {"gpu", "realistic", "high", "learned"}
+    # A prompt word like "orb" or "ball" is not enough to force the procedural
+    # primitive path. For realistic/gpu generation, only the explicit API
+    # `shape` parameter means "use a primitive"; otherwise the text-to-3D path
+    # gets the first chance. This keeps ATANOR direct-generation requests from
+    # silently degrading into low-density mock shapes.
+    shape = None if material_glass_orb else req.shape
+    real_generator_available = _USE_TRIPOSR or _USE_MV or _USE_SD
+    wants_real_generator = material_glass_orb or (shape is None and quality_wants_real)
+    if wants_real_generator and (_USE_TRIPOSR or _USE_MV or _USE_SD):
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {
+            "name": name,
+            "done": False,
+            "cache": "real_generator_pending",
+            "shape": f"real_generator:{quality}",
+            "error": None,
+            "phase": "queued",
+            "created_at": time.time(),
+            "timeout_seconds": _REAL_JOB_MAX_SECONDS,
+        }
+        threading.Thread(
+            target=_run_real_generation_job,
+            args=(job_id, name, req.prompt, quality),
+            daemon=True,
+        ).start()
+        return {
+            "status": "generating",
+            "job_id": job_id,
+            "name": name,
+            "shape": f"real_generator:{quality}",
+            "cache": "real_generator_pending",
+            "eta_seconds": 30,
+            "poll": f"/v1/job/{job_id}",
+        }
+    if shape is None and (not quality_wants_real or not real_generator_available):
+        shape = next((s for w, s in _SHAPE_WORDS.items() if w in req.prompt.lower()), None)
     result = _engine.generate_3d_object(name, _prompt_to_mv(req.prompt), cam_rays={"shape": shape})
     job_id = uuid.uuid4().hex[:12]
-    _jobs[job_id] = {"name": name, "done": result == "hit"}
+    _jobs[job_id] = {"name": name, "done": result == "hit", "cache": result, "shape": shape}
     eta = 0 if result == "hit" else 5  # hit ~instant; miss ~5s (honest ETA)
     return {
         "status": "displayed" if result == "hit" else "generating",
@@ -846,10 +1605,31 @@ def get_job(job_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="unknown job")
 
     name = job["name"]
-    _engine.tick(name)
-    events = [{"state": e.state.value, "info": e.info} for e in _engine.drain_events()]
-    done = name in _engine.cache and _engine.state == HoloState.DISPLAYED
-    job["done"] = done
+    cache_state = str(job.get("cache") or "")
+    events: List[Dict[str, Any]] = []
+    if cache_state.startswith("real_generator"):
+        done = bool(job.get("done"))
+        created = float(job.get("created_at") or time.time())
+        elapsed = max(0.0, time.time() - created)
+        timeout = float(job.get("timeout_seconds") or _REAL_JOB_MAX_SECONDS)
+        if not done and timeout > 0 and elapsed > timeout:
+            job.update({
+                "done": True,
+                "cache": "real_generator_timeout",
+                "shape": f"real_generator_timeout:{cache_state}",
+                "phase": "timeout",
+                "error": f"real generator exceeded {timeout:.0f}s without completing",
+                "verified": False,
+                "hot_swap": False,
+                "cancelled": True,
+                "finished_at": time.time(),
+            })
+            done = True
+    else:
+        _engine.tick(name)
+        events = [{"state": e.state.value, "info": e.info} for e in _engine.drain_events()]
+        done = name in _engine.cache and _engine.state == HoloState.DISPLAYED
+        job["done"] = done
 
     resp: Dict[str, Any] = {
         "job_id": job_id,
@@ -857,8 +1637,21 @@ def get_job(job_id: str) -> Dict[str, Any]:
         "state": _engine.state.value,
         "events": events,
         "done": done,
+        "cache": job.get("cache"),
+        "shape": job.get("shape"),
+        "phase": job.get("phase"),
     }
-    if done and _engine.field is not None:
+    if job.get("created_at"):
+        resp["elapsed_seconds"] = round(max(0.0, time.time() - float(job["created_at"])), 3)
+    if job.get("timeout_seconds"):
+        resp["timeout_seconds"] = job.get("timeout_seconds")
+    if job.get("error"):
+        resp["error"] = job.get("error")
+    if done and cache_state == "real_generator" and isinstance(job.get("sgf"), dict):
+        resp["sgf"] = job.get("sgf")
+        resp["verified"] = bool(job.get("verified"))
+        resp["hot_swap"] = bool(job.get("hot_swap"))
+    elif done and _engine.field is not None and name in _engine.cache:
         resp["sgf"] = _sgf_summary(_engine.field)
         resp["verified"] = bool(_engine.cache[name].verified)
         resp["hot_swap"] = True

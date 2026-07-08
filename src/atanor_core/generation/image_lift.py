@@ -87,6 +87,58 @@ def _logit(p, eps=1e-4):
     return np.log(p / (1 - p))
 
 
+def _central_subject_mask(rgb: np.ndarray) -> np.ndarray:
+    """Fallback foreground mask for generated images with an imperfect cutout.
+
+    SD-Turbo sometimes ignores the requested plain background. The old fallback
+    treated a failed mask as "everything is foreground", which made the viewer
+    render a giant dust cube instead of an object. This keeps the reconstruction
+    honest: when alpha/background keying is weak, retain the most salient
+    centered connected component instead of inventing full-frame geometry.
+    """
+    H, W = rgb.shape[:2]
+    border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]], axis=0)
+    bg = np.median(border, axis=0)
+    diff = np.linalg.norm(rgb - bg[None, None, :], axis=2)
+    chroma = rgb.max(axis=2) - rgb.min(axis=2)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    cx = (xx / max(1, W - 1) - 0.5) * 2.0
+    cy = (yy / max(1, H - 1) - 0.5) * 2.0
+    center_prior = np.exp(-(cx * cx + cy * cy) / 0.72)
+    diff_n = diff / (float(np.percentile(diff, 96)) + 1e-6)
+    chroma_n = chroma / (float(np.percentile(chroma, 96)) + 1e-6)
+    saliency = (diff_n + 0.45 * chroma_n) * (0.42 + 0.58 * center_prior)
+    threshold = float(np.percentile(saliency, 70))
+    mask = (saliency > threshold).astype(np.float32)
+    try:
+        from scipy import ndimage
+
+        mask = ndimage.binary_opening(mask > 0.5, iterations=1)
+        mask = ndimage.binary_closing(mask, iterations=2)
+        labels, count = ndimage.label(mask)
+        if count > 0:
+            best_label = 0
+            best_score = -1.0
+            center = np.array([H * 0.5, W * 0.5], np.float32)
+            for label in range(1, count + 1):
+                ys, xs = np.where(labels == label)
+                if ys.size < max(16, H * W * 0.006):
+                    continue
+                centroid = np.array([ys.mean(), xs.mean()], np.float32)
+                dist = np.linalg.norm((centroid - center) / np.array([H, W], np.float32))
+                score = float(ys.size) * (1.0 - min(0.9, dist * 1.8))
+                if score > best_score:
+                    best_score = score
+                    best_label = label
+            if best_label:
+                mask = labels == best_label
+        mask = ndimage.binary_fill_holes(mask)
+        mask = ndimage.binary_dilation(mask, iterations=1)
+        return mask.astype(np.float32)
+    except Exception:
+        return (_box_blur(mask, 2, 2) > 0.42).astype(np.float32)
+
+
 class Image25DGenerator:
     """Real CPU image -> VOLUMETRIC point-cloud GaussianField.
 
@@ -125,8 +177,14 @@ class Image25DGenerator:
             mask = (diff > thr).astype(np.float32)
         mask = (_box_blur(mask, 1, 1) > 0.5).astype(np.float32)
         cov = float(mask.mean())
-        if cov < 0.02 or cov > 0.97:     # keying failed or fills frame -> billboard
-            mask = np.ones((H, W), np.float32)
+        if cov < 0.02 or cov > 0.78:     # keying failed or fills frame -> centered subject
+            mask = _central_subject_mask(rgb)
+            cov = float(mask.mean())
+        if cov < 0.02 or cov > 0.82:     # last-resort soft oval, never full-frame cube
+            yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+            x = (xx / max(1, W - 1) - 0.5) / 0.34
+            y = (yy / max(1, H - 1) - 0.5) / 0.42
+            mask = ((x * x + y * y) < 1.0).astype(np.float32)
 
         # (2) THICKNESS field from the distance transform: how deep the solid is
         #     at each pixel (thick core, zero rim). NOT a front/back plane — this
