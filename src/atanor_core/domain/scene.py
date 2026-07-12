@@ -114,13 +114,28 @@ class Scene:
         for src, dst, style in self.links:
             if src in self.objects and dst in self.objects:
                 fields.append(self._link_field(src, dst, style))
+        # Objects can come from DIFFERENT generators whose SH have different coefficient
+        # counts — a procedural shape carries K=4 (a directional band) while a TripoSR /
+        # flat-color field carries K=1. Concatenating them raw raised ValueError and 500'd
+        # the whole scene ('지구와 달' = procedural 지구 + TripoSR 달). Pad every field's SH
+        # up to the max K with zeros (a flat-color object simply has no higher-order
+        # directional detail) so mixed-generator scenes compose cleanly.
+        kmax = max(f.sh.shape[1] for f in fields)
+
+        def _sh(f: GaussianField) -> np.ndarray:
+            if f.sh.shape[1] == kmax:
+                return f.sh
+            padded = np.zeros((f.sh.shape[0], kmax, 3), np.float32)
+            padded[:, : f.sh.shape[1], :] = f.sh
+            return padded
+
         return GaussianField(
             means=np.concatenate([f.means for f in fields], 0),
             scales=np.concatenate([f.scales for f in fields], 0),
             quats=np.concatenate([f.quats for f in fields], 0),
             opacities=np.concatenate([f.opacities for f in fields], 0),
-            sh=np.concatenate([f.sh for f in fields], 0),
-            sh_degree=fields[0].sh_degree,
+            sh=np.concatenate([_sh(f) for f in fields], 0),
+            sh_degree=max(f.sh_degree for f in fields),
         )
 
     def _link_field(self, src: str, dst: str, style: Dict[str, Any]) -> GaussianField:

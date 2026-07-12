@@ -31,3 +31,6 @@ Thumbs.db
 .vscode/
 
 .vercel
+gen_fail.log
+splatra_sidecar_debug*.log
+*.err.log
