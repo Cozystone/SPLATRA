@@ -81,7 +81,8 @@
     <span class="pill" id="modelPill">ollama: …</span>
     <span class="pill" id="countPill">0 splats</span>
     <span class="pill" id="statePill">IDLE</span>
-    <span class="pill" id="buildPill" title="build version">build skel-v7</span>
+    <span class="pill" id="physPill">matter —</span>
+    <span class="pill" id="buildPill" title="build version">build lod-v22</span>
   </div>
 </header>
 
@@ -97,23 +98,19 @@
       <button class="ctl" id="spin">▶ spin</button>
       <button class="ctl" id="reassemble">⟳ reassemble</button>
       <button class="ctl" id="cycle">∞ auto-cycle</button>
-      <button class="ctl" id="invert" title="flip drag direction">⇄ invert</button>
+      <button class="ctl" id="invX" title="flip left/right drag">⇄ X</button>
+      <button class="ctl" id="invY" title="flip up/down drag">⇅ Y</button>
       <label class="slider">size <input id="sizeR" type="range" min="0.4" max="2.4" step="0.1" value="1.0"></label>
-    </div>
-    <div id="anim" style="position:absolute;left:8px;bottom:8px;display:flex;gap:4px;flex-wrap:wrap">
-      <span style="color:var(--muted);font-size:11px;align-self:center">animate:</span>
-      <button class="ctl anim" data-a="breathe">🫁 breathe</button>
-      <button class="ctl anim" data-a="sway">🌿 sway</button>
-      <button class="ctl anim" data-a="bounce">⬆ bounce</button>
-      <button class="ctl anim" data-a="float">🎈 float</button>
-      <button class="ctl anim" data-a="jelly">🟦 jelly</button>
-      <button class="ctl anim" data-a="wave">🌊 wave</button>
-      <button class="ctl anim" data-a="walk">🚶 walk</button>
-      <button class="ctl anim" data-a="handwave">👋 wave hand</button>
-      <button class="ctl anim" data-a="stop">⏹ stop</button>
+      <button class="ctl" id="mvBtn" title="reconstruct from several generated views — real back and sides, but SLOW (several minutes): the multi-view model is loaded in a separate process for each build">🔄 all-round (slow)</button>
+      <label class="slider" title="points per part — higher is denser and slower">detail <input id="detailR" type="range" min="1" max="5" step="1" value="3"><b id="detailV">3</b></label>
     </div>
     <div id="hint" class="overlay">drag = orbit · scroll = zoom · right/shift-drag = pan · real anisotropic 3DGS on your GPU</div>
     <div id="fps" class="overlay"></div>
+    <div id="prog" style="position:absolute;left:8px;right:8px;bottom:34px;display:none;background:rgba(6,10,20,.82);border:1px solid #21324a;border-radius:8px;padding:7px 10px;font-size:12px">
+      <div style="display:flex;justify-content:space-between;color:var(--muted)"><span id="progLabel">working…</span><span id="progPct">0%</span></div>
+      <div style="height:6px;background:#16233a;border-radius:4px;margin-top:5px;overflow:hidden">
+        <div id="progBar" style="height:100%;width:0%;background:linear-gradient(90deg,#27e0b0,#4ea8ff);transition:width .25s"></div></div>
+    </div>
   </section>
 
   <section id="side">
@@ -178,16 +175,23 @@ layout(location=0) in vec2 aCorner;     // quad corner in {-1,1}
 layout(location=1) in uint aIndex;       // sorted splat index (back-to-front)
 uniform sampler2D uData; uniform int uTexW;
 uniform mat4 uProj, uView; uniform vec2 uFocal, uViewport;
-uniform float uT, uSizeScale, uTime, uModelScale, uSwirl;
+uniform float uT, uSizeScale, uTime, uModelScale, uSwirl, uLodGrow, uMaxQuad;
 uniform int uFxMode; uniform vec3 uFxCenter; uniform float uFxAmt;  // narration FX
 uniform int uAnimMode; uniform float uAnimT, uAnimAmp;              // procedural animation
-uniform float uRigHipY, uRigShoulderY, uRigCenterX;                // skeleton fitted to the model
+uniform int uNJ;                                                    // learned rig (mode 11)
+uniform vec3 uJPos[16]; uniform vec3 uJOut[16]; uniform float uJReach;
+uniform mat3 uJRot[16]; uniform vec3 uJTrans[16];   // per-joint FK rigid transform (built in JS)
+uniform sampler2D uBind; uniform int uBindW;      // per-splat proxy binding (idx4, w4)
+uniform sampler2D uPDisp; uniform int uPDispW;    // proxy displacements (material sim)
+uniform int uPhys; uniform float uPhysAmt;        // semantic material rigging
+uniform int uNEye; uniform vec4 uEyes[4];           // semantic parts: eye spheres (xyz,r)
+uniform float uBlink;                               // 0 open .. 1 closed
+uniform float uFloorY;                              // model floor for material melt modes
 out vec3 vColor; out float vOpacity; out vec2 vQuad; out float vGlow;
 
 vec4 texel(int p){ return texelFetch(uData, ivec2(p % uTexW, p / uTexW), 0); }
 vec3 hash3(vec3 p){ p = fract(p*vec3(443.897,441.423,437.195)); p += dot(p, p.yzx+19.19); return fract((p.xxy+p.yzz)*p.zyx); }
 vec3 rotAxis(vec3 p, vec3 ax, float a){ float c=cos(a), s=sin(a); return p*c + cross(ax,p)*s + ax*dot(ax,p)*(1.0-c); }
-vec3 swing(vec3 p, vec3 pv, vec3 ax, float a){ return rotAxis(p - pv, ax, a) + pv; }  // limb rotate about a joint
 
 void main(){
   int base = int(aIndex)*4;
@@ -215,59 +219,96 @@ void main(){
     else if (uFxMode == 3) { vGlow = uFxAmt*1.1; }
   }
 
-  // procedural deformation animation: canonical cloud -> time-warped pose. No
-  // training — hand-authored deformation fields driven by uAnimT (phase) so the
-  // generated model can breathe / sway / bounce / float / wobble / wave / spin.
-  if (uAnimMode > 0) {
-    float aA = uAnimAmp, ph = uAnimT;
-    if (uAnimMode == 1) {                    // breathe (inflate/deflate from center)
-      pos += home * (sin(ph) * 0.07 * aA);
-    } else if (uAnimMode == 2) {             // sway (bend, stronger higher up)
-      float up = clamp(home.y*0.5 + 0.5, 0.0, 1.0);
-      pos.x += sin(ph) * 0.30 * aA * up;
-      pos.z += cos(ph*0.9) * 0.12 * aA * up;
-    } else if (uAnimMode == 3) {             // bounce + squash
-      float b = abs(sin(ph));
-      pos.y += (b - 0.3) * 0.32 * aA;
-      float sq = mix(1.0, 0.82, (1.0 - b) * aA);
-      pos.y *= sq; pos.x /= sqrt(sq); pos.z /= sqrt(sq);
-    } else if (uAnimMode == 4) {             // float / gentle bob + drift
-      pos.y += sin(ph) * 0.12 * aA;
-      pos.x += sin(ph*0.6 + home.y*2.0) * 0.05 * aA;
-    } else if (uAnimMode == 5) {             // jelly / soft-body wobble
-      pos += sin(vec3(ph*1.7) + home*6.0) * (0.06 * aA);
-    } else if (uAnimMode == 6) {             // wave travelling across x
-      pos.y += sin(ph + home.x*4.0) * 0.12 * aA;
-    } else if (uAnimMode == 7) {             // spin (turntable)
-      float c = cos(ph), s = sin(ph);
-      pos.xz = mat2(c, -s, s, c) * pos.xz;
-    } else if (uAnimMode == 8 || uAnimMode == 9) {
-      // SMOOTH skinning (no torn body): each limb gets a continuous weight that
-      // fades to 0 toward the torso, so swings blend in instead of cutting. The
-      // hip/shoulder heights + center are FITTED to this model (uniforms), so it
-      // adapts to the generated shape instead of using fixed thresholds.
-      float cx = uRigCenterX, hipY = uRigHipY, shY = uRigShoulderY;
-      vec3 X = vec3(1.0,0.0,0.0), Z = vec3(0.0,0.0,1.0);
-      float leftn  = 1.0 - smoothstep(cx-0.02, cx+0.10, home.x);   // 1 on the left
-      float rightn = smoothstep(cx-0.10, cx+0.02, home.x);          // 1 on the right
-      float low    = 1.0 - smoothstep(hipY-0.04, hipY+0.18, home.y);// 1 below hips (legs)
-      float side   = smoothstep(0.08, 0.26, abs(home.x-cx));        // 1 at the sides (arms)
-      float armB   = smoothstep(hipY-0.05, shY, home.y) * (1.0 - smoothstep(shY, shY+0.18, home.y));
-      float wLegL=low*leftn, wLegR=low*rightn, wArmL=side*armB*leftn, wArmR=side*armB*rightn;
-      vec3 d = vec3(0.0);
-      if (uAnimMode == 8) {                  // WALK: legs alternate, arms counter-swing
-        float sw = sin(ph) * 0.55 * aA;
-        d += (swing(home, vec3(cx-0.10,hipY,0.0), X,  sw)     - home) * wLegL;
-        d += (swing(home, vec3(cx+0.10,hipY,0.0), X, -sw)     - home) * wLegR;
-        d += (swing(home, vec3(cx-0.18,shY,0.0),  X, -sw*0.7) - home) * wArmL;
-        d += (swing(home, vec3(cx+0.18,shY,0.0),  X,  sw*0.7) - home) * wArmR;
-        pos += d; pos.y += abs(sin(ph))*0.03*aA;     // body bob
-      } else {                               // WAVE: raise & wag the right arm
-        float raise = (1.3 + 0.5*sin(ph*4.0)) * aA;
-        d += (swing(home, vec3(cx+0.16,shY,0.0), Z, -raise) - home) * wArmR;
-        pos += d;
+  // 🌀 microbot flow: particles drift on a bounded curl-like field so the object
+  // is ALWAYS gently alive (Big-Hero-6 microbots), shape held. ~9 sin/cos/vertex
+  // -> runs on a low-end laptop GPU. Same formula as motion/flow.py.
+  if (uAnimMode == 10) {
+    float ff = 2.3, aA = uAnimAmp, ph = uAnimT;
+    vec3 q = home*ff + vec3(ph*0.6, ph*0.5, ph*0.7);
+    vec3 fl = vec3(sin(q.y)*cos(q.z), sin(q.z)*cos(q.x), sin(q.x)*cos(q.y));
+    fl.x += 0.5*sin(ph*0.30 + home.y*1.5);
+    fl.y += 0.5*cos(ph*0.27 + home.z*1.5);
+    fl.z += 0.5*sin(ph*0.33 + home.x*1.5);
+    pos += fl * (0.06 * aA);
+  }
+
+  // 🦴 learned rig (mode 11): the SERVER's rig predictor found this model's
+  // joints (/v1/rig); each particle binds to its nearest DISTAL joint — same
+  // rule as rigging/live_rig.bind_joints — and follows that joint's FK rigid
+  // transform. TRUE forward kinematics: JS composes per-joint mat3+offset down
+  // each chain every frame (16 tiny matrices), the GPU just applies its one —
+  // segments stay coherent instead of shearing, at zero extra vertex cost.
+  if (uAnimMode == 11 && uNJ > 0) {
+    int bj = -1; float bd = 1e9; float bproj = 0.0;
+    for (int k = 0; k < 16; k++) {
+      if (k >= uNJ) break;
+      float proj = dot(home - uJPos[k], uJOut[k]);
+      if (proj > 0.0) {
+        float dd = distance(home, uJPos[k]);
+        if (dd < bd) { bd = dd; bj = k; bproj = proj; }
       }
     }
+    if (bj >= 0) {
+      float w = smoothstep(0.0, uJReach*0.5, bproj);
+      vec3 posed = uJRot[bj]*home + uJTrans[bj];
+      pos += (posed - home) * (w * uAnimAmp);
+    }
+  }
+
+  // 💧 water (12) / 🏜 soil (13): stateless GPU material approximations —
+  // uAnimAmp is the MELT fraction (ramps on activate, reverses on stop), so a
+  // model can dissolve into a puddle / crumble into a mound and re-freeze.
+  // (The server's PBD is the real simulation; this is its bounded visual twin.)
+  if (uAnimMode == 12) {
+    float m = uAnimAmp; vec3 hh = hash3(home*3.7);
+    float fall = smoothstep(0.0, 1.0, m*1.35 - hh.x*0.35);
+    float py = uFloorY + 0.02 + hh.x*0.05;
+    vec3 dirout = normalize(vec3(home.x, 0.0, home.z) + vec3(1e-4));
+    vec3 puddle = vec3(home.x, py, home.z) + dirout*(0.55 + 0.7*hh.y)*fall;
+    puddle.x += 0.04*sin(uAnimT*1.7 + home.z*9.0);      // surface ripple
+    puddle.z += 0.04*cos(uAnimT*1.5 + home.x*9.0);
+    pos = mix(pos, puddle, fall);
+  }
+  if (uAnimMode == 13) {
+    float m = uAnimAmp; vec3 hh = hash3(home*5.1);
+    float p = clamp((m*1.5 - hh.x*0.8)/0.5, 0.0, 1.0);  // grains break loose in waves
+    p = p*p*(3.0-2.0*p);
+    float pile = uFloorY + 0.02 + hh.y*hh.y*0.30;       // mound keeps thickness
+    vec3 crumb = vec3(home.x*(1.0+0.25*p*hh.z), pile, home.z*(1.0+0.25*p*hh.x));
+    crumb.x += 0.015*sin(uAnimT*0.8 + hh.y*20.0)*p;     // grains settle, not flow
+    pos = mix(pos, crumb, p);
+  }
+
+  // 👁 semantic micro-parts: eye particles blink — ONLY the particles inside a
+  // detected eye sphere squash shut. Part-level realtime control on the GPU:
+  // the same channel later drives mouths, ears, leaves, wheels.
+  if (uNEye > 0 && uBlink > 0.001) {
+    for (int e = 0; e < 4; e++) {
+      if (e >= uNEye) break;
+      float dd = distance(home, uEyes[e].xyz);
+      float inEye = 1.0 - smoothstep(uEyes[e].w*0.85, uEyes[e].w*1.25, dd);
+      if (inEye > 0.0) {
+        float lid = uEyes[e].xyz.y + uEyes[e].w*(1.0 - 2.0*uBlink);   // lid sweeps down
+        pos.y -= max(0.0, home.y - lid) * inEye * 0.92;
+      }
+    }
+  }
+
+  // ── semantic material rigging ─────────────────────────────────────────────
+  // No skeleton. A coarse proxy of this object is simulated as a constrained
+  // material (cloth / soft / rigid / granular / fluid, assigned per region by the
+  // LLM) and every splat rides the proxy through a precomputed 4-point binding.
+  // Cloth bending constraints put real wrinkles in a dress; a rock just holds.
+  if (uPhys == 1) {
+    int b = int(aIndex) * 2;
+    vec4 bi = texelFetch(uBind, ivec2(b % uBindW, b / uBindW), 0);
+    vec4 bw = texelFetch(uBind, ivec2((b+1) % uBindW, (b+1) / uBindW), 0);
+    vec3 d = vec3(0.0);
+    int i0 = int(bi.x); d += texelFetch(uPDisp, ivec2(i0 % uPDispW, i0 / uPDispW), 0).xyz * bw.x;
+    int i1 = int(bi.y); d += texelFetch(uPDisp, ivec2(i1 % uPDispW, i1 / uPDispW), 0).xyz * bw.y;
+    int i2 = int(bi.z); d += texelFetch(uPDisp, ivec2(i2 % uPDispW, i2 / uPDispW), 0).xyz * bw.z;
+    int i3 = int(bi.w); d += texelFetch(uPDisp, ivec2(i3 % uPDispW, i3 / uPDispW), 0).xyz * bw.w;
+    pos += d * uPhysAmt;
   }
 
   pos *= uModelScale;                       // LLM can shrink/grow the whole model
@@ -276,7 +317,7 @@ void main(){
   vec4 clip = uProj * cam;
 
   // anisotropic 3D covariance (packed) -> projected 2D covariance (EWA)
-  float ss = uSizeScale*uSizeScale;
+  float ss = uSizeScale*uSizeScale*uLodGrow;   // prefix-LOD size compensation
   mat3 Vrk = mat3(t2.x,t2.y,t2.z,  t2.y,t3.x,t3.y,  t2.z,t3.y,t3.z) * ss;
   float zc = cam.z;
   mat3 J = mat3(uFocal.x/zc, 0.0, -uFocal.x*cam.x/(zc*zc),
@@ -295,8 +336,8 @@ void main(){
   float l1 = mid + rad, l2 = max(mid - rad, 0.1);
   vec2 e1 = normalize(vec2(b, l1 - a));
   vec2 e2 = vec2(e1.y, -e1.x);
-  vec2 major = min(3.0*sqrt(l1), 256.0) * e1;
-  vec2 minor = min(3.0*sqrt(l2), 256.0) * e2;
+  vec2 major = min(3.0*sqrt(l1), uMaxQuad) * e1;
+  vec2 minor = min(3.0*sqrt(l2), uMaxQuad) * e2;
 
   // keep each particle's real color through the whole morph (no white-out)
   vColor = color;
@@ -308,7 +349,7 @@ void main(){
 }`;
 
 const FRAG = `#version 300 es
-precision highp float;
+precision mediump float;   // the gaussian falloff is happy in mediump; phones are not happy in highp
 in vec3 vColor; in float vOpacity; in vec2 vQuad; in float vGlow; out vec4 frag;
 void main(){
   float r2 = dot(vQuad, vQuad);          // {-1,1} quad; ellipse at r2<=1 (3 sigma)
@@ -329,7 +370,7 @@ if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(pro
 gl.useProgram(prog);
 
 const U = {};
-["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uSwirl","uFxMode","uFxCenter","uFxAmt","uAnimMode","uAnimT","uAnimAmp","uRigHipY","uRigShoulderY","uRigCenterX"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
+["uData","uTexW","uProj","uView","uFocal","uViewport","uT","uSizeScale","uTime","uModelScale","uSwirl","uFxMode","uFxCenter","uFxAmt","uAnimMode","uAnimT","uAnimAmp","uBind","uBindW","uPDisp","uPDispW","uPhys","uPhysAmt","uNJ","uJPos","uJOut","uJReach","uJRot","uJTrans","uNEye","uEyes","uBlink","uFloorY","uLodGrow","uMaxQuad"].forEach(u=>U[u]=gl.getUniformLocation(prog,u));
 
 // quad corners (triangle strip) + per-instance index buffer
 const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -346,9 +387,11 @@ function initialCartridgeBudget(){
   if(Number.isFinite(explicit) && explicit > 0) return explicit;
   const mem = navigator.deviceMemory || 8;
   const cores = navigator.hardwareConcurrency || 8;
-  if(mem <= 4 || cores <= 4) return 50000;
-  if(mem <= 8 || cores <= 8) return 90000;
-  return 180000;
+  // a composed object is several parts deep, so the old 180k desktop cap was
+  // throwing most of the detail away before it ever reached the sorter
+  if(mem <= 4 || cores <= 4) return 80000;
+  if(mem <= 8 || cores <= 8) return 220000;
+  return 700000;
 }
 let cartridgeBudget = initialCartridgeBudget();
 let lastCartridgeFormat = "SPL2";
@@ -380,16 +423,476 @@ function camTo(y,p,d,ms){ cam.active=true; cam.fy=yaw; cam.fp=pitch; cam.fd=dist
 let modelScale=1; const ms={active:false,f:1,t:1,t0:0,dur:800};
 function scaleTo(s,dur){ ms.active=true; ms.f=modelScale; ms.t=s; ms.t0=performance.now(); ms.dur=dur||800; }
 // procedural deformation animation (canonical -> time-warp). amp ramps in/out.
-const ANIM = {none:0,breathe:1,sway:2,bounce:3,float:4,jelly:5,wave:6,spin:7,walk:8,handwave:9};
-const av = { mode:0, amp:0, target:0, speed:2.2, until:0 };
+const ANIM = {none:0,flow:10,rig:11,water:12,soil:13};
+// default: 🌀 microbot flow always on — particles are alive from the first frame,
+// gently flowing on the field (shape held) instead of sitting static or popping.
+// No ambient effect by default. The old default was flow (mode 10) ramping
+// itself to full, which is what made every finished model shimmer — a
+// generated object should sit still unless its own material says otherwise.
+const av = { mode:0, amp:0, target:0, speed:2.4, until:0 };
 function animate(style, ms2){
   const m = ANIM[style] ?? (style==="stop"||style==="none" ? 0 : av.mode);
   if(m){ av.mode=m; av.target=1;
-    av.speed = style==="spin"?1.0 : (style==="walk")?6.0 : (style==="handwave")?3.0
-             : (style==="breathe"||style==="float")?1.6 : 2.4;
+    av.speed = (style==="flow")?1.0:1.6;
     av.until = ms2 ? performance.now()+ms2 : 0;   // 0 = run until stopped
   } else { av.target=0; av.until=0; }
 }
+// 🦴 learned rig: server-predicted joints (/v1/rig) + ATANOR mood (/v1/rig_mood
+// dry) -> per-joint drives computed here each frame, skinning runs in the
+// vertex shader. When the server has no matching field, lrig stays null and
+// mode 11 is a no-op (uNJ = 0).
+let lrig = null;
+let modelFloorY = -1;
+// NEUTRAL idle for generated objects. Mood only ever overwrites this when the
+// server says the displayed field IS the machine's own character (avatar) —
+// objects made to explain things do not carry the machine's emotions.
+const MOOD = { amp:0.35, tempo:0.8, jitter:0.05, droop:0.0 };
+const jDrives = new Float32Array(16);
+const jRot = new Float32Array(16*9), jTrans = new Float32Array(16*3);
+async function fetchRig(){
+  try{
+    const r = await fetch("/v1/rig"); if(!r.ok){ lrig=null; return; }
+    const d = await r.json();
+    const flat = k => { const a=new Float32Array(48); d[k].forEach((v,i)=>a.set(v,i*3)); return a; };
+    lrig = { n: Math.min(d.n_joints,16), pos: flat("joints"), out: flat("outward"),
+             joints: d.joints, chains: d.chains, centroid: d.centroid,
+             reach: d.reach, avatar: !!d.avatar };
+    classifyChains();                 // role-tag this model's own chains
+  }catch(e){ lrig=null; }
+  fetchParts();
+}
+// 👁 semantic parts (eyes for now): tiny color-contrast clusters the server
+// found on this model — the blink channel drives ONLY those particles.
+let parts = null; const eyeVec = new Float32Array(16);
+async function fetchParts(){
+  try{
+    const r = await fetch("/v1/parts"); if(!r.ok){ parts=null; return; }
+    const d = await r.json();
+    parts = { eyes: (d.eyes||[]).slice(0,4) };
+    eyeVec.fill(0);
+    parts.eyes.forEach((e,i)=>{ eyeVec.set([e.center[0],e.center[1],e.center[2],e.radius], i*4); });
+  }catch(e){ parts=null; }
+}
+let blink = 0;                                   // 0 open .. 1 closed
+const BLINK_ON = false;                          // opt-in only
+function blinkClock(t){                          // natural double-ish blinks
+  const cyc = t % 4.2;
+  if(cyc < 0.28){ const u = cyc/0.14; blink = u<1 ? u : 2-u; }   // close+open 280ms
+  else blink = 0;
+}
+// FK: compose each chain's per-joint rigid transform (rot about moving pivots),
+// exactly rigging/live_rig.pose_chain — done here on 16 joints, applied on GPU.
+function m3axis(ax,ay,az,a){ const c=Math.cos(a),s=Math.sin(a),t=1-c;
+  return [t*ax*ax+c,t*ax*ay-s*az,t*ax*az+s*ay, t*ax*ay+s*az,t*ay*ay+c,t*ay*az-s*ax,
+          t*ax*az-s*ay,t*ay*az+s*ax,t*az*az+c]; }
+function m3mul(A,B){ const R=new Array(9);
+  for(let r=0;r<3;r++)for(let c=0;c<3;c++)
+    R[r*3+c]=A[r*3]*B[c]+A[r*3+1]*B[3+c]+A[r*3+2]*B[6+c];
+  return R; }
+function m3v(A,v){ return [A[0]*v[0]+A[1]*v[1]+A[2]*v[2],
+                           A[3]*v[0]+A[4]*v[1]+A[5]*v[2],
+                           A[6]*v[0]+A[7]*v[1]+A[8]*v[2]]; }
+// ── semantic material rigging (XPBD) ────────────────────────────────────────
+// The LLM says what the object is MADE OF (/v1/material_spec); we simulate a
+// coarse proxy of THIS object as a constrained material and every splat rides it.
+// There is no skeleton and no authored clip: a dress falls and wrinkles because
+// its region is cloth with bending constraints, a rock holds because it is rigid,
+// sand slumps because its constraints barely resist. Different object -> different
+// material field -> different motion, with nothing hand-animated.
+const PHYS = {
+  on: true, amt: 0, target: 0, spec: null,
+  n: 0, home: null, x: null, v: null, mat: null, stiff: null, damp: null,
+  drive: null, gain: null, anchor: null,
+  e0: null, e1: null, erest: null, ecomp: null,
+  dispTex: null, dispBuf: null, dispW: 0,
+  bindTex: null, bindW: 0, ready: false, wind: 0,
+};
+const MAT_ID = { rigid: 0, soft: 1, cloth: 2, strand: 3, granular: 4, fluid: 5 };
+
+function _proxyDownsample(pos, n, targetN){
+  // one representative point per occupied voxel -> even coverage, cheap
+  let lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+  for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++){
+    const v = pos[i*3+c]; if (v < lo[c]) lo[c] = v; if (v > hi[c]) hi[c] = v;
+  }
+  const ext = Math.max(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]) || 1;
+  let g = Math.max(4, Math.round(Math.cbrt(targetN) * 1.6));
+  const cell = ext / g, map = new Map();
+  for (let i = 0; i < n; i++){
+    const cx = Math.floor((pos[i*3]  -lo[0])/cell), cy = Math.floor((pos[i*3+1]-lo[1])/cell),
+          cz = Math.floor((pos[i*3+2]-lo[2])/cell);
+    const key = cx + 131*cy + 17161*cz;
+    if (!map.has(key)) map.set(key, i);
+  }
+  const idx = Array.from(map.values());
+  const out = new Float32Array(idx.length*3);
+  idx.forEach((src, k) => { out[k*3]=pos[src*3]; out[k*3+1]=pos[src*3+1]; out[k*3+2]=pos[src*3+2]; });
+  return { p: out, n: idx.length, lo, hi, ext, cell };
+}
+
+function _hashGrid(p, n, cell){
+  const M = new Map();
+  const key = (a,b,c) => a + 131*b + 17161*c;
+  for (let i = 0; i < n; i++){
+    const k = key(Math.floor(p[i*3]/cell), Math.floor(p[i*3+1]/cell), Math.floor(p[i*3+2]/cell));
+    let arr = M.get(k); if (!arr) M.set(k, arr = []); arr.push(i);
+  }
+  return { M, cell, key,
+    near(x, y, z){                       // indices in the 27 neighbouring cells
+      const cx = Math.floor(x/cell), cy = Math.floor(y/cell), cz = Math.floor(z/cell), out = [];
+      for (let a=-1;a<=1;a++) for (let b=-1;b<=1;b++) for (let c=-1;c<=1;c++){
+        const arr = M.get(key(cx+a, cy+b, cz+c)); if (arr) out.push(...arr);
+      }
+      return out;
+    } };
+}
+
+function buildPhysics(spec){
+  PHYS.ready = false;
+  if (!homePos || !COUNT || !spec) return;
+  const t0 = performance.now();
+  PHYS.spec = spec;
+  const D = _proxyDownsample(homePos, COUNT, 1000);
+  const n = D.n, p = D.p;
+  PHYS.n = n; PHYS.home = p; PHYS.x = p.slice(); PHYS.v = new Float32Array(n*3);
+  PHYS.mat = new Uint8Array(n); PHYS.stiff = new Float32Array(n);
+  PHYS.damp = new Float32Array(n); PHYS.gain = new Float32Array(n);
+  PHYS.drive = new Array(n); PHYS.anchor = new Float32Array(n);
+
+  // ── ground the LLM's regions onto this cloud (normalized y / radial) ──────
+  const cy0 = (D.lo[1]+D.hi[1])/2, hy = Math.max(1e-6, (D.hi[1]-D.lo[1])/2);
+  const cx0 = (D.lo[0]+D.hi[0])/2, cz0 = (D.lo[2]+D.hi[2])/2;
+  let rmax = 1e-6;
+  for (let i = 0; i < n; i++)
+    rmax = Math.max(rmax, Math.hypot(p[i*3]-cx0, p[i*3+2]-cz0));
+  const regions = spec.regions || [];
+  for (let i = 0; i < n; i++){
+    const yn = (p[i*3+1]-cy0)/hy, rn = Math.hypot(p[i*3]-cx0, p[i*3+2]-cz0)/rmax;
+    let r = regions[0] || {material:"soft", stiffness:0.5, damping:0.1, drive:"none", gain:1};
+    for (const cand of regions)                       // later match wins (paint order)
+      if (yn >= cand.y[0] && yn <= cand.y[1] && rn >= cand.radial[0] && rn <= cand.radial[1]) r = cand;
+    PHYS.mat[i] = MAT_ID[r.material] ?? 1;
+    PHYS.stiff[i] = r.stiffness; PHYS.damp[i] = r.damping;
+    PHYS.drive[i] = r.drive; PHYS.gain[i] = r.gain;
+    // what stays planted
+    const a = spec.anchor;
+    PHYS.anchor[i] = (a === "feet" || a === "base") ? (yn < -0.82 ? 1 : 0)
+                   : (a === "top") ? (yn > 0.82 ? 1 : 0) : 0;
+  }
+
+  // ── constraints: local structure + a second ring for cloth bending ────────
+  const grid = _hashGrid(p, n, D.cell*2.2);
+  const E0 = [], E1 = [], ER = [], EC = [], seen = new Set();
+  const nbr = new Array(n);
+  for (let i = 0; i < n; i++){
+    const cand = grid.near(p[i*3], p[i*3+1], p[i*3+2]);
+    const scored = [];
+    for (const j of cand){
+      if (j === i) continue;
+      const d = Math.hypot(p[j*3]-p[i*3], p[j*3+1]-p[i*3+1], p[j*3+2]-p[i*3+2]);
+      scored.push([d, j]);
+    }
+    scored.sort((a,b)=>a[0]-b[0]);
+    const k = scored.slice(0, 8);
+    nbr[i] = k.map(s=>s[1]);
+    for (const [d, j] of k){
+      const a = Math.min(i,j), b = Math.max(i,j), key = a*1000003 + b;
+      if (seen.has(key) || d < 1e-6) continue;
+      seen.add(key);
+      const st = Math.max(PHYS.stiff[i], PHYS.stiff[j]);
+      E0.push(a); E1.push(b); ER.push(d); EC.push(0.75 + 0.25*st);
+    }
+  }
+  // bending ring: cloth/strand keep their sheet shape instead of collapsing —
+  // this is what actually produces folds rather than a shapeless sag.
+  for (let i = 0; i < n; i++){
+    if (PHYS.mat[i] !== MAT_ID.cloth && PHYS.mat[i] !== MAT_ID.strand) continue;
+    for (const j of nbr[i]) for (const k2 of (nbr[j]||[])){
+      if (k2 === i) continue;
+      const a = Math.min(i,k2), b = Math.max(i,k2), key = a*1000003 + b;
+      if (seen.has(key)) continue;
+      const d = Math.hypot(p[k2*3]-p[i*3], p[k2*3+1]-p[i*3+1], p[k2*3+2]-p[i*3+2]);
+      if (d > D.cell*6) continue;
+      seen.add(key); E0.push(a); E1.push(b); ER.push(d); EC.push(0.10 + 0.25*PHYS.stiff[i]);
+    }
+  }
+  PHYS.e0 = new Int32Array(E0); PHYS.e1 = new Int32Array(E1);
+  PHYS.erest = new Float32Array(ER); PHYS.ecomp = new Float32Array(EC);
+
+  // ── bind every splat to its 4 nearest proxy points (once) ────────────────
+  const bw = 2048, rows = Math.ceil((COUNT*2)/bw);
+  const bind = new Float32Array(bw*rows*4);
+  for (let i = 0; i < COUNT; i++){
+    const x = homePos[i*3], y = homePos[i*3+1], z = homePos[i*3+2];
+    let cand = grid.near(x,y,z);
+    if (cand.length < 4) cand = Array.from({length:Math.min(n,8)},(_,q)=>q);
+    const best = [[1e9,0],[1e9,0],[1e9,0],[1e9,0]];
+    for (const j of cand){
+      const d = (p[j*3]-x)**2 + (p[j*3+1]-y)**2 + (p[j*3+2]-z)**2;
+      if (d < best[3][0]){ best[3] = [d,j]; best.sort((a,b)=>a[0]-b[0]); }
+    }
+    let ws = best.map(b => 1/(Math.sqrt(b[0])+1e-4)), sum = ws.reduce((a,b)=>a+b,0) || 1;
+    ws = ws.map(w=>w/sum);
+    const o = i*2*4;
+    bind[o]   = best[0][1]; bind[o+1] = best[1][1]; bind[o+2] = best[2][1]; bind[o+3] = best[3][1];
+    bind[o+4] = ws[0];      bind[o+5] = ws[1];      bind[o+6] = ws[2];      bind[o+7] = ws[3];
+  }
+  if (!PHYS.bindTex) PHYS.bindTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, PHYS.bindTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, bw, rows, 0, gl.RGBA, gl.FLOAT, bind);
+  PHYS.bindW = bw;
+
+  // proxy displacement texture (tiny: one texel per proxy point)
+  const pw = 64, ph = Math.ceil(n/pw);
+  PHYS.dispW = pw; PHYS.dispBuf = new Float32Array(pw*ph*4);
+  if (!PHYS.dispTex) PHYS.dispTex = gl.createTexture();
+  let anchored = false;
+  for (let i = 0; i < n; i++) if (PHYS.anchor[i]) { anchored = true; break; }
+  if (!anchored) {
+    let mx=0, my=0, mz=0;
+    for (let i=0;i<n;i++){ mx+=disp[i*4]; my+=disp[i*4+1]; mz+=disp[i*4+2]; }
+    mx/=n; my/=n; mz/=n;
+    for (let i=0;i<n;i++){
+      disp[i*4]-=mx; disp[i*4+1]-=my; disp[i*4+2]-=mz;
+      x[i*3]-=mx; x[i*3+1]-=my; x[i*3+2]-=mz;
+    }
+  }
+  gl.bindTexture(gl.TEXTURE_2D, PHYS.dispTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, pw, ph, 0, gl.RGBA, gl.FLOAT, PHYS.dispBuf);
+  PHYS.maxDisp = D.ext * 0.22;      // motion budget, in the object's own scale
+  // Rigid/solid matter gets a far tighter leash than cloth or fluid, so a
+  // generated solid reads as still rather than gently breathing.
+  PHYS.solidCap = D.ext * 0.02;
+  PHYS.ready = true;
+  PHYS.buildMs = Math.round(performance.now()-t0);
+  PHYS.edges = PHYS.e0.length;
+}
+
+function stepPhysics(dt, t){
+  if (!PHYS.ready) return;
+  dt = Math.min(dt, 0.033);
+  const n = PHYS.n, x = PHYS.x, v = PHYS.v, h = PHYS.home;
+  PHYS.wind = 0.55 + 0.45*Math.sin(t*0.7) + 0.25*Math.sin(t*1.9 + 1.3);
+  // 1) forces chosen by the material's own drive — never a keyframe
+  for (let i = 0; i < n; i++){
+    const d = PHYS.drive[i], g = PHYS.gain[i], m = PHYS.mat[i];
+    let fx = 0, fy = 0, fz = 0;
+    if (d === "gravity" || d === "gravity+wind") fy -= 1.6*g;
+    if (d === "wind" || d === "gravity+wind"){
+      const ph = t*1.7 + h[i*3]*3.1 + h[i*3+1]*2.3;
+      fx += 3.2*PHYS.wind*g*(0.9 + 0.6*Math.sin(ph));
+      fz += 1.6*PHYS.wind*g*Math.cos(ph*1.3);
+      fy += 1.0*g*Math.sin(ph*1.7);
+    }
+    if (d === "breath"){                       // slow volume pulse along the outward dir
+      const s = Math.sin(t*1.6)*2.2*g;
+      fx += h[i*3]*s; fy += h[i*3+1]*s; fz += h[i*3+2]*s;
+    }
+    if (d === "jiggle"){
+      fx += 2.0*g*Math.sin(t*3.1 + i*0.7);
+      fy += 2.0*g*Math.sin(t*2.7 + i*1.3);
+      fz += 2.0*g*Math.sin(t*3.6 + i*2.1);
+    }
+    if (d === "flow"){                          // swirl about the vertical axis
+      fx += -h[i*3+2]*3.0*g*(0.6+0.4*Math.sin(t*1.1));
+      fz +=  h[i*3]  *3.0*g*(0.6+0.4*Math.sin(t*1.1));
+      fy += 1.2*g*Math.sin(t*2.2 + h[i*3+1]*4.0);
+    }
+    if (m === MAT_ID.granular || m === MAT_ID.fluid) fy -= 3.0;  // always settles
+    const damp = 1 - Math.min(0.14, PHYS.damp[i]*0.55);
+    v[i*3]   = (v[i*3]  + fx*dt)*damp;
+    v[i*3+1] = (v[i*3+1]+ fy*dt)*damp;
+    v[i*3+2] = (v[i*3+2]+ fz*dt)*damp;
+    x[i*3]   += v[i*3]  *dt; x[i*3+1] += v[i*3+1]*dt; x[i*3+2] += v[i*3+2]*dt;
+  }
+  // 2) XPBD: satisfy the material's constraints
+  const e0 = PHYS.e0, e1 = PHYS.e1, er = PHYS.erest, ec = PHYS.ecomp, E = e0.length;
+  for (let it = 0; it < 6; it++){
+    for (let e = 0; e < E; e++){
+      const a = e0[e], b = e1[e];
+      let dx = x[b*3]-x[a*3], dy = x[b*3+1]-x[a*3+1], dz = x[b*3+2]-x[a*3+2];
+      const L = Math.hypot(dx,dy,dz); if (L < 1e-7) continue;
+      const corr = (L - er[e]) / L * 0.5 * (0.25 + 0.75*ec[e]);
+      dx *= corr; dy *= corr; dz *= corr;
+      const wa = PHYS.anchor[a] ? 0 : 1, wb = PHYS.anchor[b] ? 0 : 1;
+      if (wa){ x[a*3] += dx; x[a*3+1] += dy; x[a*3+2] += dz; }
+      if (wb){ x[b*3] -= dx; x[b*3+1] -= dy; x[b*3+2] -= dz; }
+    }
+  }
+  // 3) identity: stiff matter returns home, cloth is free to hang and fold
+  const disp = PHYS.dispBuf;
+  for (let i = 0; i < n; i++){
+    if (PHYS.anchor[i]){ x[i*3]=h[i*3]; x[i*3+1]=h[i*3+1]; x[i*3+2]=h[i*3+2]; }
+    else {
+      const m2 = PHYS.mat[i];
+      const base = (m2 === MAT_ID.cloth || m2 === MAT_ID.strand) ? 0.010
+                 : (m2 === MAT_ID.granular || m2 === MAT_ID.fluid) ? 0.006
+                 : (m2 === MAT_ID.rigid) ? 0.220 : 0.090;
+      const k = base * (0.5 + 0.5*PHYS.stiff[i]);
+      x[i*3]   += (h[i*3]  -x[i*3]  )*k;
+      x[i*3+1] += (h[i*3+1]-x[i*3+1])*k;
+      x[i*3+2] += (h[i*3+2]-x[i*3+2])*k;
+    }
+    let ddx = x[i*3]-h[i*3], ddy = x[i*3+1]-h[i*3+1], ddz = x[i*3+2]-h[i*3+2];
+    const mm = PHYS.mat[i];
+    const soft = (mm === MAT_ID.cloth || mm === MAT_ID.strand ||
+                  mm === MAT_ID.fluid || mm === MAT_ID.granular);
+    const dl = Math.hypot(ddx,ddy,ddz), lim = soft ? PHYS.maxDisp : PHYS.solidCap;
+    if (dl > lim){ const f2 = lim/dl; ddx*=f2; ddy*=f2; ddz*=f2;
+      x[i*3]=h[i*3]+ddx; x[i*3+1]=h[i*3+1]+ddy; x[i*3+2]=h[i*3+2]+ddz;
+      v[i*3]*=0.3; v[i*3+1]*=0.3; v[i*3+2]*=0.3; }
+    disp[i*4]   = x[i*3]  -h[i*3];
+    disp[i*4+1] = x[i*3+1]-h[i*3+1];
+    disp[i*4+2] = x[i*3+2]-h[i*3+2];
+  }
+  let anchored = false;
+  for (let i = 0; i < n; i++) if (PHYS.anchor[i]) { anchored = true; break; }
+  if (!anchored) {
+    let mx=0, my=0, mz=0;
+    for (let i=0;i<n;i++){ mx+=disp[i*4]; my+=disp[i*4+1]; mz+=disp[i*4+2]; }
+    mx/=n; my/=n; mz/=n;
+    for (let i=0;i<n;i++){
+      disp[i*4]-=mx; disp[i*4+1]-=my; disp[i*4+2]-=mz;
+      x[i*3]-=mx; x[i*3+1]-=my; x[i*3+2]-=mz;
+    }
+  }
+  gl.bindTexture(gl.TEXTURE_2D, PHYS.dispTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PHYS.dispW,
+                   Math.ceil(PHYS.n/PHYS.dispW), gl.RGBA, gl.FLOAT, disp);
+}
+
+async function loadMaterialSpec(){
+  try{
+    const r = await fetch(`${API}/v1/material_spec`);
+    if(!r.ok) return;
+    const d = await r.json();
+    if(!d || !d.regions) return;
+    buildPhysics(d);
+    // Only matter that genuinely moves on its own gets simulated. A solid object
+    // sitting there has no business drifting, however subtly — cloth, hair, fluid
+    // and loose grains do.
+    const DYNAMIC = new Set(["cloth", "strand", "fluid", "granular"]);
+    const moves = (d.regions || []).some(r => DYNAMIC.has(r.material));
+    PHYS.on = moves; PHYS.target = moves ? 1 : 0;
+    const pill = document.getElementById("physPill");
+    if (pill) pill.textContent = `${d.kind} · ${d.regions.map(r=>r.material).join("/")}`;
+  }catch(e){}
+}
+
+// ── skeleton-aware motion synthesis ─────────────────────────────────────────
+// The rig predictor discovers this model's OWN joints/chains. We classify those
+// chains by geometry (what hangs below the body is a leg, what sticks out to the
+// side is a limb/wing, a long axial chain is a spine/tail) and synthesise actions
+// from those roles. Nothing assumes a humanoid: a bird flaps the chains it has,
+// a snake gets a travelling wave down its single chain, a chair just rocks.
+let chainInfo = [];
+function classifyChains(){
+  chainInfo = [];
+  if(!lrig) return;
+  const C = lrig.centroid, R = Math.max(1e-3, lrig.reach || 1);
+  let bestUp = -1e9, waver = null;
+  for(const chain of (lrig.chains || [])){
+    const tip = lrig.joints[chain[chain.length-1]] || C;
+    const v = [tip[0]-C[0], tip[1]-C[1], tip[2]-C[2]];
+    const n = Math.hypot(v[0],v[1],v[2]) + 1e-6;
+    const down = -v[1]/n, lateral = Math.hypot(v[0],v[2])/n;
+    let role;
+    if (down > 0.45)                        role = "leg";
+    else if (v[1] > 0.35*R && lateral < 0.6) role = "head";
+    else if (lateral > 0.55)                 role = "limb";
+    else                                     role = "spine";
+    const ci = { chain, role, side: Math.sign(v[0]) || 1, tipY: tip[1],
+                 phase: (Math.sign(v[0]) || 1) > 0 ? 0 : Math.PI };
+    if (role === "limb" && tip[1] > bestUp) { bestUp = tip[1]; waver = ci; }
+    chainInfo.push(ci);
+  }
+  // no limb/wing found (2-chain rigs, fruit, furniture): wave with whatever
+  // reaches highest, so the gesture still reads on any generated shape.
+  if (!waver && chainInfo.length)
+    waver = chainInfo.reduce((a,b) => b.tipY > a.tipY ? b : a);
+  if (waver) waver.isWaver = true;
+  // no legs found (fruit, furniture, a blob): let the axial chains carry the gait
+  if (!chainInfo.some(c => c.role === "leg"))
+    for (const c of chainInfo) if (c.role === "spine") c.gait = true;
+}
+const ACT = { name: "idle" };
+function setAction(n){ ACT.name = n; }
+function driveJoints(t){
+  for (let k=0;k<16;k++) jDrives[k] = 0;
+  if (!lrig) return;
+  const a = ACT.name;
+  for (const ci of chainInfo){
+    const L = ci.chain.length;
+    for (let c=0;c<L;c++){
+      const j = ci.chain[c]; if (j >= 16) continue;
+      const distal = (c+1)/L;                 // distal joints swing more, like a real limb
+      let d = 0;
+      {                                 // idle — the ATANOR mood breath
+        d = MOOD.amp*Math.sin(MOOD.tempo*t + j*1.7)
+          + MOOD.jitter*0.3*Math.sin(7.3*t + j*2.9) - MOOD.droop*0.35;
+      }
+      jDrives[j] += d;
+    }
+  }
+}
+function computeFK(t){
+  const I=[1,0,0,0,1,0,0,0,1];
+  for(let k=0;k<16;k++){ jRot.set(I,k*9); jTrans.set([0,0,0],k*3); }
+  if(!lrig) return;
+  driveJoints(t);
+  for(const chain of (lrig.chains||[])){
+    const Jw = chain.map(j=>lrig.joints[j].slice());       // working joints
+    let prev = lrig.centroid.slice();
+    let R = I.slice(), T = [0,0,0];                        // running transform
+    for(let c=0;c<chain.length;c++){
+      const j = chain[c]; if(j>=16) continue;
+      let d=[Jw[c][0]-prev[0],Jw[c][1]-prev[1],Jw[c][2]-prev[2]];
+      let n=Math.hypot(...d); d = n>1e-5 ? d.map(x=>x/n) : [lrig.out[j*3],lrig.out[j*3+1],lrig.out[j*3+2]];
+      let ax=[d[2],0,-d[0]]; n=Math.hypot(...ax);          // cross(d, up)
+      ax = n>1e-4 ? ax.map(x=>x/n) : [1,0,0];
+      const Rk = m3axis(ax[0],ax[1],ax[2], jDrives[j]);
+      const piv = Jw[c];
+      // running: x -> Rk*(x - piv) + piv, composed after previous transform
+      const Rn = m3mul(Rk, R);
+      const Tk = m3v(Rk, [T[0]-piv[0], T[1]-piv[1], T[2]-piv[2]]);
+      const Tn = [Tk[0]+piv[0], Tk[1]+piv[1], Tk[2]+piv[2]];
+      R = Rn; T = Tn;
+      jRot.set(R, j*9); jTrans.set(T, j*3);
+      for(let m=c+1;m<chain.length;m++){                   // downstream joints ride
+        const v = m3v(Rk, [Jw[m][0]-piv[0], Jw[m][1]-piv[1], Jw[m][2]-piv[2]]);
+        Jw[m] = [v[0]+piv[0], v[1]+piv[1], v[2]+piv[2]];
+      }
+      prev = Jw[c];
+    }
+  }
+}
+async function pollMood(){
+  if(!lrig || !lrig.avatar) return;              // emotion: machine character ONLY
+  try{
+    const r = await fetch("/v1/rig_mood", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({dry:true})});
+    if(!r.ok) return;
+    const p = (await r.json()).params;
+    MOOD.amp=p.amp; MOOD.tempo=p.tempo; MOOD.jitter=p.jitter; MOOD.droop=p.droop;
+  }catch(e){}
+}
+setInterval(()=>{ if(av.mode===11) pollMood(); }, 5000);
+// ATANOR dashboard bridge: when the studio runs embedded (/studio3d iframe),
+// the dashboard drives it by message — animate styles, cartridge reload.
+window.addEventListener("message", (ev)=>{
+  const m = ev.data;
+  if(!m || !m.splatra) return;
+  if(m.splatra === "animate") animate(m.style || "flow");
+  else if(m.splatra === "reload"){ disassemble(); setTimeout(()=>loadCartridge(true).catch(()=>{}), 520); }
+});
 // rotation-style morph: a single monotonic Y-spin (half turn out, half turn in).
 const TWO_PI=2*Math.PI; let swirl=0; const sw={active:false,f:0,t:0,t0:0,dur:800};
 function swirlTo(target,dur){ sw.active=true; sw.f=swirl; sw.t=target; sw.t0=performance.now(); sw.dur=dur||800; }
@@ -436,8 +939,16 @@ function disassemble(){ if(typeof clearOverlays==="function"){ clearOverlays(); 
     swirlTo(swirl + Math.PI, 800);                 // half-turn out
     tween(0, 800, "scatter"); } }
 
+// Local level-of-detail: the cartridge arrives shuffled, so drawing its first
+// K instances IS a uniform subsample - thin or thicken the model per frame at
+// zero cost, growing each splat by cbrt(N/K) to keep the surface closed. The
+// governor trades draw count and render scale against measured fps, locally
+// and instantly, instead of refetching cartridges over the network.
+const LOD = { draw: 0, scale: 1, maxQuad: 256 };   // draw: 0 = all
+window.LOD = LOD;
+function lodDrawN(){ return (LOD.draw > 0 && LOD.draw < COUNT) ? LOD.draw : COUNT; }
 function resize(){
-  const dpr=Math.min(devicePixelRatio||1,2);
+  const dpr=Math.min(devicePixelRatio||1,2)*LOD.scale;
   let w=canvas.clientWidth*dpr|0, h=canvas.clientHeight*dpr|0;
   if(w<10)w=900; if(h<10)h=650;
   if(canvas.width!==w||canvas.height!==h){ canvas.width=w; canvas.height=h; }
@@ -446,6 +957,9 @@ function resize(){
 // ====================================================== covariance / upload =
 function uploadModel(pos, col, scale, quat, opa){
   const n = opa.length;
+  modelFloorY = Infinity;                      // material modes melt onto this
+  for(let i=0;i<n;i++) if(pos[3*i+1] < modelFloorY) modelFloorY = pos[3*i+1];
+  if(!isFinite(modelFloorY)) modelFloorY = -1;
   const texH = Math.ceil(n*4 / TEXW);
   const tex = new Float32Array(TEXW * texH * 4);
   for (let i=0;i<n;i++){
@@ -482,44 +996,30 @@ function uploadModel(pos, col, scale, quat, opa){
   order = new Uint32Array(n); for(let i=0;i<n;i++) order[i]=i;
   depths = new Float32Array(n);
   lastSortKey = "";
-  fitRig(pos, n);                       // place hip/shoulder joints for this model's proportions
   document.getElementById("countPill").textContent = `${n.toLocaleString()} splats · ${lastCartridgeFormat}`;
-}
-// Fit a coarse upright skeleton to the actual point cloud so limb motion adapts
-// to the generated shape (vs fixed thresholds). Uses the vertical extent + the
-// centroid x, with robust 2%/98% percentiles to ignore stray points.
-const rig = { hipY:-0.3, shoulderY:0.35, centerX:0 };
-function fitRig(pos, n){
-  const ys = []; let sx=0;
-  const step = Math.max(1, (n/20000)|0);          // subsample for speed
-  for(let i=0;i<n;i+=step){ ys.push(pos[i*3+1]); sx += pos[i*3]; }
-  ys.sort((a,b)=>a-b);
-  const lo = ys[Math.floor(ys.length*0.02)], hi = ys[Math.floor(ys.length*0.98)];
-  const h = Math.max(1e-3, hi-lo);
-  rig.hipY      = lo + h*0.46;          // hips ~46% up
-  rig.shoulderY = lo + h*0.74;          // shoulders ~74% up
-  rig.centerX   = sx / Math.max(1, Math.ceil(n/step));
+  setTimeout(loadMaterialSpec, 0);      // matter sim follows the geometry
 }
 
 // ====================================================== depth sort (16-bit) =
 const counts = new Uint32Array(65536);
-let lastSortKey = "";
+let lastSortKey = "", lastSortT = 0;
 function sortSplats(view){
   if (!COUNT) return;
+  const N = lodDrawN();                 // sort cost follows the drawn prefix
   const m2=view[2], m6=view[6], m10=view[10], m14=view[14];
   let zmin=1e30, zmax=-1e30;
-  for(let i=0;i<COUNT;i++){
+  for(let i=0;i<N;i++){
     const d = m2*homePos[3*i] + m6*homePos[3*i+1] + m10*homePos[3*i+2] + m14;
     depths[i]=d; if(d<zmin)zmin=d; if(d>zmax)zmax=d;
   }
   // ascending d => most-negative (farthest, since cam looks -z) first => back-to-front
   const scale = 65535 / ((zmax - zmin) || 1);
   counts.fill(0);
-  for(let i=0;i<COUNT;i++){ counts[((depths[i]-zmin)*scale)|0]++; }
+  for(let i=0;i<N;i++){ counts[((depths[i]-zmin)*scale)|0]++; }
   for(let k=1;k<65536;k++) counts[k]+=counts[k-1];
-  for(let i=COUNT-1;i>=0;i--){ const key=((depths[i]-zmin)*scale)|0; order[--counts[key]]=i; }
+  for(let i=N-1;i>=0;i--){ const key=((depths[i]-zmin)*scale)|0; order[--counts[key]]=i; }
   gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, order, gl.DYNAMIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, N===COUNT ? order : order.subarray(0, N), gl.DYNAMIC_DRAW);
 }
 
 // ============================================================= render loop ==
@@ -561,9 +1061,10 @@ function frame(){
     const fovy=50*Math.PI/180, asp=canvas.width/canvas.height;
     const proj=perspective(fovy,asp,0.05,100), view=lookAt(eye,target,[0,1,0]);
 
-    // re-sort when the view changed enough, or while animating
-    const key = `${yaw.toFixed(3)},${pitch.toFixed(3)},${dist.toFixed(2)},${target.map(v=>v.toFixed(2))}`;
-    if(key!==lastSortKey || anim.mode!=="idle"){ sortSplats(view); lastSortKey=key; }
+    // re-sort when the view changed enough; during continuous animation a
+    // ~90ms-stale order is invisible and the saved sorts are a phone's budget
+    const key = `${yaw.toFixed(3)},${pitch.toFixed(3)},${dist.toFixed(2)},${target.map(v=>v.toFixed(2))},${lodDrawN()}`;
+    if(key!==lastSortKey || (anim.mode!=="idle" && now-lastSortT>90)){ sortSplats(view); lastSortKey=key; lastSortT=now; }
 
     gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.DEPTH_TEST);
     gl.useProgram(prog); gl.bindVertexArray(vao);
@@ -579,24 +1080,66 @@ function frame(){
     av.amp += (av.target - av.amp) * 0.06;                 // smooth ramp in/out
     if(av.amp < 0.004 && av.target===0) av.mode=0;
     gl.uniform1i(U.uAnimMode, av.mode); gl.uniform1f(U.uAnimT, now*0.001*av.speed); gl.uniform1f(U.uAnimAmp, av.amp);
-    gl.uniform1f(U.uRigHipY, rig.hipY); gl.uniform1f(U.uRigShoulderY, rig.shoulderY); gl.uniform1f(U.uRigCenterX, rig.centerX);
+    if(av.mode===11 && lrig){
+      computeFK(now*0.001);                    // FK rigid transforms, 16 joints
+      gl.uniform1i(U.uNJ, lrig.n); gl.uniform3fv(U.uJPos, lrig.pos);
+      gl.uniform3fv(U.uJOut, lrig.out); gl.uniform1f(U.uJReach, lrig.reach);
+      gl.uniformMatrix3fv(U.uJRot, true, jRot); gl.uniform3fv(U.uJTrans, jTrans);
+    } else { gl.uniform1i(U.uNJ, 0); }
+    // Blinking is an ambient effect nobody asked for, and the eye detector fires on
+    // things that have no eyes. A generated object holds still unless asked.
+    if(BLINK_ON && parts && parts.eyes.length){
+      blinkClock(now*0.001);
+      gl.uniform1i(U.uNEye, parts.eyes.length); gl.uniform4fv(U.uEyes, eyeVec);
+      gl.uniform1f(U.uBlink, blink);
+    } else { gl.uniform1i(U.uNEye, 0); gl.uniform1f(U.uBlink, 0); }
+    gl.uniform1f(U.uFloorY, modelFloorY);
+    gl.uniform1f(U.uLodGrow, Math.pow(COUNT/lodDrawN(), 2/3));
+    gl.uniform1f(U.uMaxQuad, LOD.maxQuad);
+    if (PHYS.ready && PHYS.on) {
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, PHYS.bindTex);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, PHYS.dispTex);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform1i(U.uBind, 1); gl.uniform1i(U.uBindW, PHYS.bindW);
+      gl.uniform1i(U.uPDisp, 2); gl.uniform1i(U.uPDispW, PHYS.dispW);
+      gl.uniform1i(U.uPhys, 1); gl.uniform1f(U.uPhysAmt, PHYS.amt);
+    } else gl.uniform1i(U.uPhys, 0);
     updateOverlays(proj, view);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, lodDrawN());
   }
+  { const dtp = 1/60;
+    PHYS.amt += (PHYS.target - PHYS.amt)*0.05;
+    if (PHYS.on && PHYS.amt > 0.002) stepPhysics(dtp, now*0.001); }
   frames++;
   if(now-fpsT>500){
     const fps = Math.round(frames*1000/(now-fpsT));
-    document.getElementById("fps").textContent = `${fps} fps · ${COUNT.toLocaleString()} splats · budget ${cartridgeBudget.toLocaleString()}`;
+    const dN = lodDrawN();
+    document.getElementById("fps").textContent =
+      `${fps} fps · draw ${dN.toLocaleString()}/${COUNT.toLocaleString()}` +
+      (LOD.scale<1 ? ` @${LOD.scale.toFixed(2)}x` : "");
+    governLod(fps);
     maybeAdaptLod(fps, now);
     frames=0; fpsT=now;
   }
 }
 window.__render = frame;
-setInterval(frame, 16);   // setInterval so a backgrounded tab keeps rendering
+// vsync-aligned when visible (phones pace and batch this far better than a
+// 16ms timer). A "hidden" document still renders at 30Hz on a timer — embedded
+// and captured views report hidden while very much being watched — but the
+// governor stands down there: a timer-paced fps is the timer, not the device.
+let _bgTick = null;
+function _startLoop(){
+  if(document.hidden){ if(!_bgTick) _bgTick = setInterval(frame, 33); }
+  else { if(_bgTick){ clearInterval(_bgTick); _bgTick = null; }
+         requestAnimationFrame(function tick(){ frame(); if(!document.hidden) requestAnimationFrame(tick); }); }
+}
+document.addEventListener("visibilitychange", _startLoop);
+_startLoop();
 
 // ============================================================= input ========
 let drag=null;
-let invertDrag = localStorage.getItem("invertDrag")==="1";
+localStorage.removeItem("invertDrag");            // retire the old combined toggle
+let invX = localStorage.getItem("invX")==="1", invY = localStorage.getItem("invY")==="1";
 canvas.addEventListener("contextmenu", e=>e.preventDefault());
 canvas.addEventListener("mousedown", e=>{ drag={x:e.clientX,y:e.clientY,pan:(e.button===2||e.shiftKey)}; });
 addEventListener("mouseup", ()=>drag=null);
@@ -605,17 +1148,76 @@ addEventListener("mousemove", e=>{
   const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
   if(drag.pan){ const r=norm(cross([0,1,0],[Math.sin(yaw),0,Math.cos(yaw)])); const k=dist*0.0016;
     target[0]-=r[0]*dx*k; target[2]-=r[2]*dx*k; target[1]+=dy*k; }
-  else { const s=invertDrag?-1:1; yaw+=dx*0.01*s; pitch=Math.max(-1.45,Math.min(1.45,pitch-dy*0.01*s)); }  // orbit (⇄ invert flips both axes)
+  // grab-and-turn: camera eye = target + d*[cos(p)sin(y), sin(p), cos(p)cos(y)], so
+  // yaw+ swings the model LEFT and pitch+ tips it DOWN -> subtract dx, add dy to make
+  // the surface follow the cursor. ⇄X / ⇅Y flip each axis independently.
+  else { yaw -= dx*0.01*(invX?-1:1);
+         pitch = Math.max(-1.45, Math.min(1.45, pitch + dy*0.01*(invY?-1:1))); }
 });
 canvas.addEventListener("wheel", e=>{ e.preventDefault(); dist=Math.max(1.3,Math.min(9,dist*(1+e.deltaY*0.0012))); }, {passive:false});
+let fullQuality=false;
+let detailLevel=3;
+{ const mb=document.getElementById('mvBtn');
+  if(mb) mb.onclick=()=>{ fullQuality=!fullQuality; mb.classList.toggle('on',fullQuality); }; }
+{ const dr=document.getElementById('detailR'), dv=document.getElementById('detailV');
+  if(dr) dr.oninput=()=>{ detailLevel=parseInt(dr.value); if(dv) dv.textContent=dr.value; }; }
+
+// ── structural composition: an object built from the parts it is made of ────
+async function composeStructure(){
+  const text=(input.value||'').trim(); if(!text) return;
+  add('me','🧩 '+text.replace(/</g,'&lt;')); input.value='';
+  setState('GENERATING'); disassemble();
+  try{
+    const r=await fetch(API+'/v1/compose',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:text, detail:detailLevel, quality: fullQuality?"full":"fast"})});
+    const d=await r.json();
+    const inside=d.parts.filter(p=>p.layer!=='exterior'&&p.ok).map(p=>p.name);
+    add('bot','<span class="eng">'+d.engine+'</span><br>'+d.object+' = '+d.parts.length+
+        ' parts ('+d.generated+' generated)'+(inside.length?'<br>inside: '+inside.join(', '):''));
+    setState('DISPLAYED'); setSgf(d.sgf,0); await loadCartridge(true); loadMaterialSpec();
+  }catch(e){ add('bot','<span class="eng">error</span><br>'+e); setState('ERROR'); }
+}
+
+
+// ── progress ────────────────────────────────────────────────────────────────
+// A build can take a minute; without this there is no way to tell "still working"
+// from "wedged". The server reports the stage and how many parts are done.
+let progTimer = null;
+function fmtSecs(x){ x=Math.round(x); return x>=60 ? `${Math.floor(x/60)}m ${x%60}s` : `${x}s`; }
+function progShow(on){ const e=document.getElementById("prog"); if(e) e.style.display = on?"block":"none"; }
+function progSet(pct, label){
+  const b=document.getElementById("progBar"), p=document.getElementById("progPct"), l=document.getElementById("progLabel");
+  if(b) b.style.width = Math.max(2, Math.min(100, pct)) + "%";
+  if(p) p.textContent = Math.round(pct) + "%";
+  if(l) l.textContent = label;
+}
+function progStart(what){
+  progShow(true); progSet(2, what || "starting…");
+  clearInterval(progTimer);
+  progTimer = setInterval(async ()=>{
+    try{
+      const r = await fetch(`${API}/v1/progress`);
+      if(!r.ok) return;
+      const d = await r.json();
+      if(!d.active && d.stage === "done"){ progSet(100, "done"); return; }
+      const label = d.note ? `${d.stage} · ${d.note}` : d.stage;
+      // the server predicts the run from measured history, so show the ETA it
+      // learned rather than a bare elapsed counter
+      const eta = (d.eta != null && d.eta > 0.5) ? ` · ~${fmtSecs(d.eta)} left` : "";
+      progSet(d.percent || 2, `${label}  (${fmtSecs(d.elapsed||0)}${eta})`);
+    }catch(e){}
+  }, 500);
+}
+function progStop(){ clearInterval(progTimer); progTimer=null; progSet(100,"done"); setTimeout(()=>progShow(false), 700); }
+
 document.getElementById("spin").onclick = e=>{ autospin=!autospin; e.target.classList.toggle("on",autospin); e.target.textContent=autospin?"⏸ spin":"▶ spin"; };
-{ const ib=document.getElementById("invert"); ib.classList.toggle("on",invertDrag);
-  ib.onclick=()=>{ invertDrag=!invertDrag; localStorage.setItem("invertDrag",invertDrag?"1":"0"); ib.classList.toggle("on",invertDrag); }; }
-document.querySelectorAll("#anim .anim").forEach(b=>b.onclick=()=>{
-  const a=b.dataset.a; animate(a);
-  document.querySelectorAll("#anim .anim").forEach(x=>x.classList.toggle("on", x===b && a!=="stop"));
-  if(a==="stop") document.querySelectorAll("#anim .anim").forEach(x=>x.classList.remove("on"));
-});
+for(const [id,key] of [["invX","invX"],["invY","invY"]]){
+  const b=document.getElementById(id); if(!b) continue;
+  const get=()=> key==="invX"?invX:invY;
+  b.classList.toggle("on",get());
+  b.onclick=()=>{ if(key==="invX") invX=!invX; else invY=!invY;
+    localStorage.setItem(key, get()?"1":"0"); b.classList.toggle("on",get()); };
+}
 document.getElementById("reassemble").onclick = ()=>{ anim.t=0; tween(1,1500); };
 document.getElementById("cycle").onclick = e=>{ if(anim.mode==="cycle"){ anim.mode="idle"; tween(1,600); e.target.classList.remove("on"); }
   else { anim.mode="cycle"; anim.t0=performance.now(); e.target.classList.add("on"); } };
@@ -676,14 +1278,29 @@ function cartridgeUrl(){
   return `${API}/v1/cartridge${sep}format=spl3&budget=${Math.max(1, cartridgeBudget|0)}&_=${Date.now()}`;
 }
 
+function governLod(fps){
+  if(!COUNT || document.hidden) return;   // timer-paced frames measure the timer
+  const dN = lodDrawN();
+  if(fps < 30){
+    // cheapest visible loss first: resolution, then the overdraw cap (huge
+    // near-camera quads are what drown software rasterizers and phone GPUs),
+    // then the number of splats drawn
+    if(LOD.scale > 0.36) LOD.scale = Math.max(0.35, LOD.scale - 0.15);
+    else if(LOD.maxQuad > 28) LOD.maxQuad = Math.max(28, LOD.maxQuad * 0.6);
+    else if(dN > 10000) LOD.draw = Math.max(10000, (dN*0.72)|0);
+  } else if(fps > 55){
+    if(dN < COUNT) LOD.draw = Math.min(COUNT, (dN*1.25)|0);
+    else if(LOD.maxQuad < 256) LOD.maxQuad = Math.min(256, LOD.maxQuad / 0.6);
+    else if(LOD.scale < 1) LOD.scale = Math.min(1, LOD.scale + 0.08);
+  }
+}
+
 function maybeAdaptLod(fps, now){
   if(fixedBudget || !ONLINE || cartridgeLoading || !COUNT) return;
   if(now - lastLodAdjust < 9000) return;
-  if(fps < 34 && cartridgeBudget > 45000){
-    cartridgeBudget = Math.max(45000, Math.floor(cartridgeBudget * 0.65));
-    lastLodAdjust = now;
-    loadCartridge(false).catch(()=>{});
-  } else if(fps > 57 && COUNT >= cartridgeBudget * 0.92 && cartridgeBudget < 180000) {
+  // downgrades are handled locally by governLod, instantly and for free; the
+  // network is only asked for MORE detail, once the device has proven it
+  if(fps > 57 && lodDrawN() === COUNT && LOD.scale >= 1 && COUNT >= cartridgeBudget * 0.92 && cartridgeBudget < 180000) {
     cartridgeBudget = Math.min(180000, Math.floor(cartridgeBudget * 1.25));
     lastLodAdjust = now;
     loadCartridge(false).catch(()=>{});
@@ -704,6 +1321,7 @@ async function loadCartridge(animate=true, url=null){
     uploadModel(pos,col,scale,quat,opa);
     if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700); swirlSettle(1700);  // another half-turn in, same direction
       if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
+    fetchRig();     // ask the server for this model's learned rig (null if none)
   } finally {
     cartridgeLoading = false;
   }
@@ -740,21 +1358,26 @@ async function sendMsg(text){
   if(!ONLINE) return noBackend(text);
   if(isExplain(text)){ return narrate(text); }    // auto-route to narration
   add("me", text.replace(/</g,"&lt;")); input.value=""; send.disabled=true; setState("…");
+  progStart(text);
   disassemble();   // current model bursts into particles + swirls while generating
   try{
-    // Build commands (incl. sentence-form like "a girl wearing a hat") go straight
-    // to generation with the raw prompt — reliable, no LLM tool-call in the loop.
-    await fetch(`${API}/v1/scene/clear`,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
-    const r=await fetch(`${API}/v1/scene/spawn`,{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({prompt:text, id:"obj", position:[0,0,0], scale:1.0})});
+    // Every build is structural. The server looks the object up, works out what it
+    // is made of — outside AND inside — and assembles those parts, so a car is a
+    // body with wheels, seats and an engine rather than a hollow painted crust.
+    // Objects with nothing to decompose come back as a single part, same as before.
+    const r=await fetch(`${API}/v1/compose`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({prompt:text, detail:detailLevel, quality: fullQuality?"full":"fast"})});
     const d=await r.json();
     if(!d.ok){ throw new Error(d.detail||"generation failed"); }
-    document.getElementById("enginePill").textContent=d.engine;
-    add("bot",`<span class="eng">${d.engine}</span><br>built “${text.replace(/</g,"&lt;")}”`);
+    document.getElementById("enginePill").textContent=d.engine||"compose";
+    const ok=d.parts.filter(p=>p.ok);
+    const inside=ok.filter(p=>p.layer!=="exterior").map(p=>p.name);
+    add("bot",`<span class="eng">${d.engine}</span><br>built “${text.replace(/</g,"&lt;")}” from `
+      +`${ok.length} parts`+(inside.length?`<br>inside: ${inside.join(", ")}`:""));
     setState("DISPLAYED"); setSgf(d.sgf,0); await loadCartridge(true);
     showRating("obj", text, null);
   }catch(e){ add("bot",`<span class="eng">error</span><br>API unreachable: ${e}`); setState("ERROR"); }
-  finally{ send.disabled=false; input.focus(); }
+  finally{ progStop(); send.disabled=false; input.focus(); }
 }
 document.getElementById("chat").addEventListener("submit", e=>{ e.preventDefault(); sendMsg(input.value); });
 document.querySelectorAll(".quick .ctl").forEach(b=>b.onclick=()=>sendMsg(b.dataset.q));
@@ -831,7 +1454,7 @@ async function narrate(text){
     const d=await r.json();
     document.getElementById("enginePill").textContent="director:"+d.director;
     add("bot",`<span class="eng">director ${d.director}</span><br>building the scene — ${d.script.length} steps…`);
-    setState("GENERATING");
+    setState("GENERATING"); progStart(text);
     await playScript(d.script);          // spawn actions build the scene live
     setState("DISPLAYED");
   }catch(e){ add("bot",`<span class="eng">error</span><br>${e}`); setState("ERROR"); }

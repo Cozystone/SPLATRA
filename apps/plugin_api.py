@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
+import time
+import sys
 import re
 import struct
 import threading
@@ -741,15 +744,49 @@ def _cartridge_arrays():
 
 
 def _apply_cartridge_budget(pos, col, scale, quat, opa, budget: Optional[int] = None):
-    """Return an importance-sampled cartridge view without mutating the source arrays."""
+    """Thin the cloud to fit a device's budget without changing how it looks.
+
+    Two things went wrong with ranking by ``opacity * scale`` and keeping the top
+    k. Every splat inside one generated part shares a single size, so the ranking
+    is one value per part, not per splat: the largest part wins every slot and the
+    rest are deleted outright. A composed car handed to a 220k budget kept its
+    body shell and lost the wheels, seats and steering wheel completely.
+
+    And thinning alone makes the survivors too small. Drop a 3D cloud to a
+    fraction f of its points and the gaps between them widen by ``f**(-1/3)``,
+    while the splats stay the size they were — so the object fills with holes and
+    the near-black background reads straight through it. That is the "loose and
+    dark and broken up" look, and it gets worse the weaker the device.
+
+    So sample uniformly (which keeps every part's share of the cloud intact, in
+    proportion) and grow what survives by the same cube root, which restores the
+    ratio of splat size to point spacing exactly.
+    """
     n = int(pos.shape[0])
     if budget is None or budget <= 0 or budget >= n:
         return pos, col, scale, quat, opa
     k = max(1, int(budget))
-    importance = np.asarray(opa, np.float32) * np.max(np.asarray(scale, np.float32), axis=1)
-    chosen = np.argpartition(importance, -k)[-k:]
+    chosen = np.random.default_rng(11).choice(n, k, replace=False)
     chosen.sort()
-    return pos[chosen], col[chosen], scale[chosen], quat[chosen], opa[chosen]
+    grow = np.float32((n / float(k)) ** (1.0 / 3.0))
+    return (pos[chosen], col[chosen], (scale[chosen] * grow).astype(np.float32),
+            quat[chosen], opa[chosen])
+
+
+def _shuffle_for_lod(pos, col, scale, quat, opa):
+    """Deal the cartridge so any prefix of it is a fair sample of the object.
+
+    The arrays arrive ordered by construction — the shell's points first, then
+    each interior part in a block — so a viewer that draws only the first K
+    splats would show the shell and nothing else. One deterministic shuffle
+    makes every prefix a uniform subsample of the whole object, and that is the
+    entire trick behind the viewer's instant level-of-detail: a weak device
+    draws the first K instances (growing each splat by the cube root of the
+    thinning, the same law the budget endpoint applies), and dialing K up or
+    down costs nothing — no refetch, no re-upload, no re-pack.
+    """
+    perm = np.random.default_rng(13).permutation(int(pos.shape[0]))
+    return pos[perm], col[perm], scale[perm], quat[perm], opa[perm]
 
 
 def _pack_cartridge(pos, col, scale, quat, opa) -> bytes:
@@ -811,7 +848,7 @@ def _pack_cartridge_spl3(pos, col, scale, quat, opa) -> bytes:
 def cartridge(format: str = "spl2", budget: Optional[int] = None) -> Response:
     if _engine.field is None:
         raise HTTPException(status_code=409, detail="nothing rendered yet")
-    arrays = _apply_cartridge_budget(*_cartridge_arrays(), budget=budget)
+    arrays = _shuffle_for_lod(*_apply_cartridge_budget(*_cartridge_arrays(), budget=budget))
     fmt = format.lower().strip()
     if fmt == "spl3":
         blob = _pack_cartridge_spl3(*arrays)
@@ -1191,6 +1228,15 @@ def parts_info() -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="nothing rendered yet")
     if _engine._edges:
         return {"ok": True, "eyes": []}      # a graph has nodes, not a face
+    # Colour contrast alone happily "finds" eyes on an apple or a teapot, and the
+    # viewer then blinks a random blob. Gate on what the object actually IS: only
+    # look for eyes when the material layer says this thing has them.
+    try:
+        if not material_spec_ep().get("has_eyes", False):
+            return {"ok": True, "eyes": [], "gated": "no_eyes",
+                    "parts": _compose_state.get("part_counts") or {}}
+    except Exception:
+        pass
     f = _engine.field
     key = (int(f.num_gaussians), float(f.means[0, 0]))
     if _parts_cache.get("key") != key:
@@ -1388,8 +1434,153 @@ async def generate_from_image(image: UploadFile = File(...)) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Object generation helper (picks the best enabled generator) + JARVIS narrate.
 # --------------------------------------------------------------------------- #
-def _gen_object(prompt: str):
-    """(field, tag) for a text prompt using the best available generator."""
+
+
+
+# ── memory hygiene ──────────────────────────────────────────────────────────
+# Every generated cartridge was kept forever. At 300k points a part is ~17MB, and
+# composing an object generates several of them per prompt, so a working session
+# grew the process to ~68GB of commit and left the machine with 1GB of free RAM.
+# Keep a small working set and hand the rest back.
+_CACHE_KEEP = int(os.environ.get("SPLATRA_CACHE_KEEP", "6"))
+
+
+def _prune_caches() -> None:
+    try:
+        cache = _engine.cache
+        while len(cache) > _CACHE_KEEP:
+            cache.pop(next(iter(cache)))          # dicts keep insertion order
+    except Exception:
+        pass
+    try:
+        import gc
+
+        gc.collect()
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _park_models() -> None:
+    """Hand the GPU to a child process.
+
+    Parking only TripoSR was not enough: Stable Diffusion (even under cpu-offload)
+    and CLIPSeg keep enough resident for the multi-view child to thrash — one
+    all-round object took over ten minutes through the server versus ~2 minutes
+    standalone. Move everything off, then hand over a clean card.
+    """
+    try:
+        import torch
+
+        gen = _triposr_gen
+        if gen is not None and getattr(gen, "_model", None) is not None:
+            gen._model.to("cpu")
+        if _sd_gen is not None and getattr(_sd_gen, "_pipe", None) is not None:
+            try:
+                _sd_gen._pipe.to("cpu")
+            except Exception:
+                pass
+        try:
+            from atanor_core.vision import segment as _seg
+
+            if _seg._state.get("model") is not None:
+                _seg._state["model"].to("cpu")
+                _seg._state["dev"] = "cpu"
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _unpark_models() -> None:
+    try:
+        import torch
+
+        gen = _triposr_gen
+        if gen is not None and getattr(gen, "_model", None) is not None:
+            gen._model.to("cuda")
+        if _sd_gen is not None and getattr(_sd_gen, "_pipe", None) is not None:
+            try:
+                if getattr(_sd_gen, "_lowvram", False):
+                    _sd_gen._pipe.enable_model_cpu_offload()
+                else:
+                    _sd_gen._pipe.to("cuda")
+            except Exception:
+                pass
+        try:
+            from atanor_core.vision import segment as _seg
+
+            if _seg._state.get("model") is not None:
+                _seg._state["model"].to("cuda")
+                _seg._state["dev"] = "cuda"
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _multiview_isolated(prompt: str, timeout: float = 900.0):
+    """Multi-view reconstruction, run out-of-process.
+
+    Loading Zero123++ next to the server's cpu-offloaded Stable Diffusion trips a
+    known diffusers bug (#5281) that both fails the load AND leaves the shared
+    pipeline on the meta device, breaking every later generation. A child process
+    has its own CUDA context, so neither can happen; if it dies we simply return
+    None and the caller uses the fast path.
+    """
+    import subprocess
+    import tempfile
+
+    import numpy as np
+
+    from atanor_core.domain.sgf import GaussianField
+
+    worker = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "tools", "mv_worker.py")
+    if not os.path.exists(worker):
+        return None
+    out = os.path.join(tempfile.gettempdir(), "splatra_mv_%d.npz" % os.getpid())
+    env = dict(os.environ)
+    env["SPLATRA_LOWVRAM"] = "0"
+    # Zero123++ needs real VRAM. With our models resident it still runs, but at
+    # ~21s per diffusion step instead of under one — 12 minutes for one object.
+    # Lend the card to the child and take it back afterwards.
+    _park_models()
+    try:
+        proc = subprocess.run([sys.executable, worker, prompt, out],
+                              capture_output=True, text=True, timeout=timeout, env=env)
+        if proc.returncode != 0 or not os.path.exists(out):
+            return None
+        with np.load(out) as d:
+            field = GaussianField(
+                d["means"], d["scales"], d["quats"], d["opacities"], d["sh"],
+                sh_degree=int(d["sh_degree"]))
+        return field
+    except Exception:
+        return None
+    finally:
+        _unpark_models()
+        try:
+            os.remove(out)
+        except Exception:
+            pass
+
+
+def _gen_object(prompt: str, quality: str = "fast"):
+    """(field, tag) for a text prompt using the best available generator.
+
+    quality="fast"  -> TripoSR: one SD view lifted by a learned prior. Sharp from
+                       the front, but the sides and back are a single-view guess.
+    quality="full"  -> Zero123++ novel views + visual-hull carving: the object is
+                       reconstructed from SEVERAL consistent images, so the back
+                       and profile are actually observed rather than hallucinated.
+                       Slower (tens of seconds) — that is the trade being made.
+    """
     try:
         from atanor_core.generation.materials import glass_orb_field, looks_like_glass_orb
 
@@ -1397,6 +1588,11 @@ def _gen_object(prompt: str):
             return glass_orb_field(), "real_generator_material_glass_orb"
     except Exception:
         pass
+    if quality == "full" and _USE_MV:
+        field = _multiview_isolated(prompt)
+        if field is not None:
+            return field, "multiview-3d"
+            # otherwise fall through to the fast path
     if _USE_TRIPOSR:
         return _triposr().generate(prompt), "triposr-3d"
     if _USE_MV:
@@ -1451,6 +1647,8 @@ class SpawnRequest(BaseModel):
     position: Optional[List[float]] = None
     scale: float = 1.0
     label: Optional[str] = None
+    quality: str = "fast"          # "full" = multi-view (real back/sides, slower)
+    detail: Optional[int] = None   # 1 draft .. 5 max
 
 
 class MoveRequest(BaseModel):
@@ -1460,7 +1658,11 @@ class MoveRequest(BaseModel):
 
 @app.post("/v1/scene/spawn")
 def scene_spawn(req: SpawnRequest) -> Dict[str, Any]:
-    field, tag = _gen_object(req.prompt)
+    global _last_prompt
+    _last_prompt = req.prompt
+    _apply_detail(req.detail)
+    field, tag = _gen_object(req.prompt, getattr(req, 'quality', 'fast') or 'fast')
+    _prune_caches()
     oid = req.id or _slug(req.prompt) or f"obj{len(_scene.objects)}"
     pos = np.array(req.position, np.float32) if req.position else None
     _scene.add(SceneObject(id=oid, field=field,
@@ -1706,3 +1908,487 @@ async def ws_viewer(ws: WebSocket) -> None:
     finally:
         if ws in _viewer_sockets:
             _viewer_sockets.remove(ws)
+
+
+# ── semantic material rigging ───────────────────────────────────────────────
+# Skeletons cannot describe a dress, a flame or a pile of sand. Instead of
+# predicting bones we ask what the object is MADE OF; the viewer simulates those
+# materials with constraints, so the motion is emergent per object.
+_MAT_MODEL = os.environ.get("SPLATRA_MAT_MODEL", "dolphin3") or None
+_last_prompt: str = ""
+_mat_cache: Dict[str, Any] = {"key": None, "spec": None}
+
+
+@app.get("/v1/material_spec")
+def material_spec_ep(prompt: Optional[str] = None,
+                     model: Optional[str] = None) -> Dict[str, Any]:
+    from atanor_core.physics.semantic import material_spec
+
+    text = prompt or _last_prompt or ""
+    # what the vision model actually SAW on the last generated surface — glass,
+    # rubber, foliage... — so the simulation is grounded in the object in front of
+    # us rather than in the words that produced it
+    seen: List[Dict[str, Any]] = []
+    try:
+        seen = list(getattr(_triposr(), "last_materials", []) or [])
+    except Exception:
+        seen = []
+    key = (text, model or _MAT_MODEL, tuple(d.get("material") for d in seen))
+    if _mat_cache["key"] == key and _mat_cache["spec"]:
+        return _mat_cache["spec"]
+    spec = material_spec(text, ollama_model=model or _MAT_MODEL)
+    spec["prompt"] = text
+    spec["observed"] = seen
+    # an observed material that the text pass missed becomes its own region
+    known = {r["material"] for r in spec.get("regions", [])}
+    for obs in seen[:2]:
+        phys = obs.get("physics")
+        if phys and phys not in known and obs.get("coverage", 0) > 0.01:
+            spec.setdefault("regions", []).append({
+                "name": obs["material"], "y": [-1.0, 1.0], "radial": [0.0, 1.0],
+                "material": phys, "stiffness": 0.5, "damping": 0.12,
+                "drive": "wind" if phys in ("cloth", "strand") else "none",
+                "gain": 0.8 if phys in ("cloth", "strand", "fluid") else 0.0})
+            known.add(phys)
+    _mat_cache.update({"key": key, "spec": spec})
+    return spec
+
+
+# ── structural composition ──────────────────────────────────────────────────
+# A single-view lift returns a shell. Ask the LLM what the object is MADE of,
+# generate each part on its own, and assemble them — so a car actually contains
+# seats and an engine instead of implying them. `layer` lets the viewer strip the
+# exterior away and look inside.
+_compose_state: Dict[str, Any] = {"layers": {}}
+
+
+class ComposeRequest(BaseModel):
+    prompt: str
+    model: Optional[str] = None
+    max_parts: int = 8
+    detail: Optional[int] = None   # 1 draft .. 5 max
+    quality: str = "fast"          # "full" = all-round multi-view per part
+
+
+def _collapse_exterior(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """One labelled shell instead of a fleet of bolted-on exterior parts.
+
+    The reconstruction of "a car" already contains its wheels, lights and glass;
+    generating those again and parking them next to the body is where the
+    doubled, overlapping geometry came from. So exterior parts other than the
+    shell are not generated at all — their names become CLIPSeg prompts, the
+    shell's points get labelled with them, and the structure exists as labels on
+    one clean surface. Interior parts still generate: the shell is hollow and
+    genuinely does not contain them.
+
+    Returns (parts to generate, part-label prompts). The prompt list leads with
+    the shell phrase (label 0 / the default) and is empty when there is nothing
+    to label.
+    """
+    ext = [q for q in parts if q.get("layer") == "exterior"]
+    if len(ext) < 2:
+        return parts, []
+    shell = max(ext, key=lambda q: float(q.get("scale") or 0.0))
+    keep = [q for q in parts if q.get("layer") != "exterior" or q is shell]
+    seen, prompts = set(), [str(shell["prompt"])]
+    for q in ext:
+        if q is shell:
+            continue
+        w = str(q["prompt"]).strip().lower()
+        if w and w not in seen:
+            seen.add(w)
+            prompts.append(str(q["prompt"]))
+    return keep, prompts
+
+
+def _seat_exterior_parts() -> Dict[str, Any]:
+    """Seat bolted-on exterior parts into the shell instead of on top of it.
+
+    A part's position comes from the planner, which is guessing: it says a wheel
+    goes at [-0.45, -0.45, 0.45] without ever having seen the body it is going on.
+    Meanwhile the shell was reconstructed from a photograph of a whole car, so it
+    already *has* wheels. Bolting four more on leaves two copies of the same
+    geometry in slightly different places — the parts read as loose lumps stuck to
+    the surface rather than as one object.
+
+    The shell knows where its own wheels are, so ask it. Take the host points
+    sitting where the part was aimed, slide the part onto their centroid, then
+    delete them: the part stops duplicating the shell and starts replacing it.
+    Both steps are conservative — a part with nothing under it keeps the planner's
+    position, a snap longer than the part is refused as a bad match, and the carve
+    is capped so it can never gouge a hole through the body.
+
+    Interior parts are left alone. The shell is hollow now, so a seat has no host
+    geometry to seat against and nothing to replace.
+    """
+    layers = _compose_state.get("layers") or {}
+    ext = [(oid, ob) for oid, ob in _scene.objects.items()
+           if layers.get(oid, "exterior") == "exterior"]
+    if len(ext) < 2:
+        return {"snapped": 0, "carved": 0}
+    host_id, host = max(ext, key=lambda kv: float(kv[1].scale))
+    hw = host.world_field().means
+    keep = np.ones(hw.shape[0], bool)
+    snapped = 0
+
+    for oid, ob in ext:
+        if oid == host_id:
+            continue
+        pos = np.asarray(ob.position, np.float32)
+        pw = ob.field.means * float(ob.scale) + pos
+        half = np.maximum(np.abs(pw - pw.mean(0)).max(0), 1e-4)
+
+        near = ((np.abs(hw - pw.mean(0)) <= half * 1.6).all(1)) & keep
+        if int(near.sum()) >= 200:
+            delta = hw[near].mean(0) - pw.mean(0)
+            if float(np.linalg.norm(delta)) <= float(ob.scale) * 1.5:
+                ob.position = (pos + delta).astype(np.float32)
+                pw = pw + delta
+                snapped += 1
+
+        step = float(2.0 * half.max() / 24.0)
+        if step <= 0:
+            continue
+        lo = pw.min(0) - step
+        vox = np.floor((pw - lo) / step).astype(np.int64)
+        occ = np.zeros(tuple(vox.max(0) + 3), bool)
+        occ[vox[:, 0] + 1, vox[:, 1] + 1, vox[:, 2] + 1] = True
+        for ax in (0, 1, 2):                     # reach one cell further out, so a
+            for sh in (-1, 1):                   # host surface a splat away still goes
+                occ |= np.roll(occ, sh, ax)
+        hv = np.floor((hw - lo) / step).astype(np.int64) + 1
+        inb = ((hv >= 0) & (hv < np.array(occ.shape))).all(1)
+        idx = np.where(inb & keep)[0]
+        if idx.size:
+            keep[idx[occ[hv[idx, 0], hv[idx, 1], hv[idx, 2]]]] = False
+
+    carved = int((~keep).sum())
+    if carved and keep.sum() >= hw.shape[0] * 0.65:   # never gouge the body
+        f = host.field
+        host.field = GaussianField(
+            f.means[keep], f.scales[keep], f.quats[keep], f.opacities[keep],
+            f.sh[keep], sh_degree=f.sh_degree)
+    else:
+        carved = 0
+    return {"snapped": snapped, "carved": carved, "host": host_id}
+
+
+@app.post("/v1/compose")
+def compose_object(req: ComposeRequest) -> Dict[str, Any]:
+    from atanor_core.structure.decompose import decompose
+
+    global _last_prompt
+    _last_prompt = req.prompt
+    _apply_detail(req.detail)
+    plan = decompose(req.prompt, ollama_model=req.model or _MAT_MODEL)
+    parts = plan["parts"][: max(1, min(12, req.max_parts))]
+    # Composing costs a full generation per distinct part, so it has to buy
+    # something. A car (body, wheels, seats, engine) earns it; an apple split into
+    # "skin" and "flesh" does not — that was 19s for a result a single 3s object
+    # matches. Fall back to one object unless the decomposition is genuinely
+    # structural: several parts, at least one of them hidden inside.
+    # Counting parts cannot tell an apple from a car — the model happily gives an
+    # apple a "stem" and a "calyx" as interior, and a house only one interior part.
+    # Ask the question directly instead: does this thing have a designed inside?
+    distinct = len({p["prompt"].strip().lower() for p in parts})
+    has_inside = any(p["layer"] != "exterior" for p in parts)
+    # all-round asks for one carefully reconstructed object; splitting it into
+    # eight parts and reconstructing each from six novel views is minutes of work
+    # for detail that is 20cm wide. Pick one or the other, not both.
+    want_single = (req.quality or "fast") == "full"
+    planned = list(parts)
+    if (want_single or not plan.get("has_interior")
+            or len(parts) < 3 or distinct < 2 or not has_inside):
+        parts = [{"name": "whole", "prompt": req.prompt, "at": [0.0, 0.0, 0.0],
+                  "scale": 1.0, "layer": "exterior"}]
+        plan["engine"] = (plan.get("engine") or "") + "+single"
+
+    parts, label_prompts = _collapse_exterior(parts)
+    if not label_prompts and len(planned) > 1:
+        # a single-object build still deserves to understand itself: reuse the
+        # plan's part vocabulary as labels on the one shell it does generate
+        _, label_prompts = _collapse_exterior(planned)
+        if label_prompts:
+            label_prompts[0] = req.prompt
+    _scene.objects.clear()
+    _scene.links.clear()
+    _scene.version += 1
+    _compose_state["layers"] = {}
+    _compose_state["part_names"] = []
+    _compose_state["part_counts"] = {}
+
+    cache: Dict[str, Any] = {}          # 4 wheels cost one generation, not four
+    built = []
+    # all-round costs a full multi-view reconstruction PER PART. Doing that for
+    # every wheel and seat turns a 10s build into many minutes for detail nobody
+    # can see once it is 20cm wide — so only the main shell earns it.
+    biggest = max((float(p["scale"]) for p in parts), default=1.0)
+    total_steps = float(len(parts))
+
+    from atanor_core.state import timing
+
+    # Predict the run from measured history: only the first generation of each
+    # distinct prompt costs anything (the rest are cache hits), and a shell costs
+    # far more than a wheel.
+    q_req = (req.quality or "fast")
+    seen_keys, est_total = set(), 2.0
+    for prt in parts:
+        pq = q_req if (q_req != "full" or float(prt["scale"]) >= biggest - 1e-6) else "fast"
+        if prt["prompt"].strip().lower() in seen_keys:
+            continue
+        seen_keys.add(prt["prompt"].strip().lower())
+        dflt = 120.0 if pq == "full" else (7.0 if float(prt["scale"]) > 0.7 else 4.0)
+        est_total += timing.estimate(_timing_key(pq, req.detail, float(prt["scale"])), dflt)
+    _prog_begin(est_total, "planning", plan["object"])
+
+    for step, part in enumerate(parts):
+        pq_now = q_req if (q_req != "full" or float(part["scale"]) >= biggest - 1e-6) else "fast"
+        k_now = _timing_key(pq_now, req.detail, float(part["scale"]))
+        _prog_step("generating", part["name"],
+                   timing.estimate(k_now, 120.0 if pq_now == "full" else 6.0))
+        key = (part["prompt"].strip().lower(), round(float(part["scale"]), 2))
+        if key not in cache:
+            try:
+                _detail_for_part(req.detail, part["scale"])
+                try:
+                    _triposr().part_prompts = (
+                        label_prompts if float(part["scale"]) >= 0.9 else [])
+                except Exception:
+                    pass
+                small = float(part["scale"]) < 0.5
+                prev = (os.environ.get("SPLATRA_SD_BESTOF"),
+                        os.environ.get("SPLATRA_MATERIALS"))
+                if small:            # framing and surface material barely register
+                    os.environ["SPLATRA_SD_BESTOF"] = "1"
+                    os.environ["SPLATRA_MATERIALS"] = "0"
+                try:
+                    q = (req.quality or "fast")
+                    if q == "full" and float(part["scale"]) < biggest - 1e-6:
+                        q = "fast"          # only the shell gets all-round
+                    _t0 = time.time()
+                    cache[key] = _gen_object(part["prompt"], q)[0]
+                    timing.record(_timing_key(q, req.detail, float(part["scale"])),
+                                  time.time() - _t0)
+                finally:
+                    for k, v in zip(("SPLATRA_SD_BESTOF", "SPLATRA_MATERIALS"), prev):
+                        if v is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = v
+            except Exception as exc:
+                built.append({"name": part["name"], "ok": False,
+                              "error": type(exc).__name__})
+                continue
+        field = cache[key]
+        if float(part["scale"]) >= 0.9 and label_prompts:
+            try:
+                gen = _triposr()
+                if getattr(gen, "last_part_labels", None) is not None:
+                    lab = gen.last_part_labels
+                    _compose_state["part_names"] = list(gen.last_part_names)
+                    _compose_state["part_counts"] = {
+                        gen.last_part_names[i]: int((lab == i).sum())
+                        for i in range(len(gen.last_part_names)) if (lab == i).any()}
+            except Exception:
+                pass
+        oid = _slug(part["name"]) or part["name"]
+        _scene.add(SceneObject(id=oid, field=field,
+                               position=np.array(part["at"], np.float32),
+                               scale=float(part["scale"]), label=part["name"]))
+        _compose_state["layers"][oid] = part["layer"]
+        built.append({"name": part["name"], "id": oid, "layer": part["layer"],
+                      "at": part["at"], "scale": part["scale"], "ok": True})
+
+    _prog("assembling", total_steps, total_steps)
+    if not _scene.objects:
+        _prog_done()
+        # every part failed to generate — say so instead of crashing on an empty
+        # scene inside the flatten
+        _prune_caches()
+        return {"ok": False, "object": plan["object"],
+                "detail": "no part could be generated",
+                "engine": plan.get("engine"), "parts": built,
+                "generated": len(cache), "layers": [], "sgf": None}
+    seated = _seat_exterior_parts()
+    _scene_display()
+    _prune_caches()
+    timing.record("compose:%s" % q_req, time.time() - (_progress.get("started") or time.time()))
+    _prog_done()
+    return {"ok": True, "object": plan["object"], "engine": plan.get("engine"),
+            "parts": built, "generated": len(cache), "seated": seated,
+            "layers": sorted(set(_compose_state["layers"].values())),
+            "sgf": _sgf_summary(_engine.field) if _engine.field is not None else None}
+
+
+@app.get("/v1/scene/layer")
+def scene_layer(show: str = "all") -> Dict[str, Any]:
+    """Show every part, or strip the shell away and reveal what is inside."""
+    layers = _compose_state.get("layers") or {}
+    if not layers:
+        _scene_display()
+        return {"ok": True, "show": "all", "note": "no composed layers"}
+    hidden = []
+    if show == "interior":
+        hidden = [oid for oid, layer in layers.items() if layer == "exterior"]
+    keep = {oid: o for oid, o in _scene.objects.items() if oid not in hidden}
+    if not keep:
+        keep = dict(_scene.objects)
+    stash = dict(_scene.objects)
+    try:
+        _scene.objects = keep
+        _scene_display()
+    finally:
+        _scene.objects = stash
+    return {"ok": True, "show": show, "hidden": hidden,
+            "visible": list(keep)}
+
+
+# ── precision ───────────────────────────────────────────────────────────────
+# Density costs time (grid^3 field queries), so it is a dial rather than a
+# constant. 5 is what this GPU will take before the field query stops fitting.
+# (sampling grid, point cap) per detail step. The grids are far finer than they
+# used to be because two things changed: the volume is carved down to its surface
+# shell, so a given point cap now buys three times the surface it did when most of
+# the points were buried; and the density field is walked in slabs, so peak memory
+# no longer follows grid^3 (it is flat at ~2.9GB from 256 all the way to 576 on a
+# 5080). What is left is a straight time-for-detail trade, which is the slider's
+# whole job: ~2.5s a part at step 1, ~6s at step 5.
+_DETAIL_LEVELS = {
+    1: (256, 120_000),
+    2: (320, 220_000),
+    3: (384, 300_000),
+    4: (480, 450_000),
+    5: (576, 700_000),
+}
+
+
+
+
+def _max_detail_for_vram(total_gb: Optional[float]) -> int:
+    """The finest detail step this GPU can afford.
+
+    The ladder's upper steps sample 480^3-576^3 fields and hold ~700k points;
+    on a 4GB card that is an out-of-memory crash dressed up as a slider. Clamp
+    by measured VRAM so one build serves the 5080 and a low-end laptop alike —
+    the slider still goes to 5, it just quietly tops out at what fits.
+    """
+    if not total_gb:
+        return 5
+    if total_gb < 4.0:
+        return 1
+    if total_gb < 6.0:
+        return 2
+    if total_gb < 8.0:
+        return 3
+    if total_gb < 11.0:
+        return 4
+    return 5
+
+
+_VRAM_GB: Optional[float] = None
+
+
+def _detail_clamped(level: Optional[int]) -> int:
+    global _VRAM_GB
+    if _VRAM_GB is None:
+        try:
+            import torch
+            _VRAM_GB = (torch.cuda.get_device_properties(0).total_memory / 2**30
+                        if torch.cuda.is_available() else 0.0)
+        except Exception:
+            _VRAM_GB = 0.0
+    lvl = int(max(1, min(5, level or 3)))
+    return min(lvl, _max_detail_for_vram(_VRAM_GB))
+
+
+def _timing_key(quality: str, detail: Optional[int], scale: float) -> str:
+    """Group work by what actually drives its cost: pipeline, detail, part size."""
+    size = "shell" if scale > 0.7 else ("mid" if scale > 0.35 else "small")
+    return "part:%s:d%s:%s" % (quality or "fast", int(detail or 3), size)
+
+
+def _detail_for_part(level: Optional[int], part_scale: float) -> None:
+    """Size the sampling to the part. Surface area goes with scale^2, so a wheel at
+    0.22 needs a small fraction of the body's points to look equally dense."""
+    base_grid, base_pts = _DETAIL_LEVELS.get(_detail_clamped(level), _DETAIL_LEVELS[3])
+    f = max(0.12, min(1.0, float(part_scale))) ** 2
+    pts = max(25_000, int(base_pts * f))
+    grid = max(128, int(base_grid * (0.45 + 0.55 * min(1.0, float(part_scale)))))
+    try:
+        gen = _triposr()
+        gen.grid, gen.n_points = grid, pts
+    except Exception:
+        pass
+
+
+def _apply_detail(level: Optional[int]) -> None:
+    """Point the shared TripoSR generator at a precision level (1 draft .. 5 max)."""
+    if not level:
+        return
+    grid, pts = _DETAIL_LEVELS.get(int(max(1, min(5, level))), _DETAIL_LEVELS[3])
+    try:
+        gen = _triposr()
+        gen.grid, gen.n_points = grid, pts
+    except Exception:
+        pass
+
+
+# ── progress ────────────────────────────────────────────────────────────────
+# Generation can take a minute or more and until now the UI gave no sign whether
+# it was working or wedged. Every long path reports what it is doing and how far
+# along it is; the viewer polls this and draws a bar.
+_progress: Dict[str, Any] = {"active": False, "stage": "idle", "done": 0.0,
+                             "total": 1.0, "note": "", "started": 0.0,
+                             "est_total": 0.0, "elapsed_before": 0.0,
+                             "step_est": 0.0, "confidence": 0.0}
+
+
+def _prog_begin(est_total: float, stage: str = "starting", note: str = "") -> None:
+    """Open a run whose expected duration is `est_total` seconds."""
+    _progress.update({"active": True, "stage": stage, "note": note,
+                      "started": time.time(), "est_total": max(0.5, float(est_total)),
+                      "elapsed_before": 0.0, "step_est": 0.0,
+                      "done": 0.0, "total": 1.0})
+
+
+def _prog_step(stage: str, note: str, step_est: float) -> None:
+    """Begin a sub-step expected to take `step_est` seconds."""
+    _progress.update({"active": True, "stage": stage, "note": note,
+                      "elapsed_before": time.time() - (_progress["started"] or time.time()),
+                      "step_est": max(0.2, float(step_est))})
+
+
+def _prog(stage: str, done: float = 0.0, total: float = 1.0, note: str = "") -> None:
+    """Compatibility shim for call sites that only know step counts."""
+    _progress.update({"active": True, "stage": stage, "note": note})
+    if not _progress["started"]:
+        _progress["started"] = time.time()
+        _progress["est_total"] = max(_progress.get("est_total", 0.0), 1.0)
+
+
+def _prog_done() -> None:
+    _progress.update({"active": False, "stage": "done", "done": 1.0, "total": 1.0,
+                      "started": 0.0, "est_total": 0.0, "step_est": 0.0})
+
+
+@app.get("/v1/progress")
+def progress() -> Dict[str, Any]:
+    from atanor_core.state import timing
+
+    p = dict(_progress)
+    started = p.get("started") or 0.0
+    elapsed = (time.time() - started) if started else 0.0
+    est = float(p.get("est_total") or 0.0)
+    # Fraction of the LEARNED duration, not of the step count — a car body and a
+    # wheel are both "one part" but differ twentyfold, so counting steps produced
+    # a bar that sat at 0% through the slowest part of the job.
+    frac = (elapsed / est) if est > 0 else 0.0
+    # never claim finished before we are: ease off as we approach the estimate
+    frac = frac if frac < 0.9 else 0.9 + 0.1 * (1.0 - math.exp(-(frac - 0.9) * 3.0))
+    out = dict(p)
+    out["percent"] = round(100.0 * max(0.0, min(0.99, frac)), 1) if p.get("active") else         (100.0 if p.get("stage") == "done" else 0.0)
+    out["elapsed"] = round(elapsed, 1)
+    out["eta"] = round(max(0.0, est - elapsed), 1) if est > 0 else None
+    out["est_total"] = round(est, 1)
+    out["learned"] = timing.snapshot()
+    return out
