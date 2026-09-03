@@ -128,7 +128,9 @@ class TripoSRGenerator:
             colors = np.concatenate(ck, 0)
             del pk, ck
 
-        if os.environ.get("SPLATRA_CLEAN") == "1":   # opt-in: adds ~0.5s/gen
+        if os.environ.get("SPLATRA_CLEAN") != "0":   # on by default (~0.5s):
+            # stray disconnected specks read as flicker and colour noise the
+            # moment the model turns; SPLATRA_CLEAN=0 opts back out
             kpts, colors = self._remove_floaters(kpts, colors)
         if os.environ.get("SPLATRA_SHELL", "1") == "1":
             kpts, colors = self._surface_shell(kpts, colors, step=2.0 * r / (N - 1))
