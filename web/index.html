@@ -1220,8 +1220,9 @@ function frame(){
     const fps = Math.round(frames*1000/(now-fpsT));
     const dN = lodDrawN();
     document.getElementById("fps").textContent =
-      `${fps} fps · draw ${dN.toLocaleString()}/${COUNT.toLocaleString()}` +
-      (LOD.scale<1 ? ` @${LOD.scale.toFixed(2)}x` : "");
+      `${fps} fps · ` +
+      (dN===COUNT ? `${COUNT.toLocaleString()}` : `${dN.toLocaleString()}/${COUNT.toLocaleString()}`) +
+      (LOD.scale<0.99 ? ` @${LOD.scale.toFixed(2)}x` : "");
     governLod(fps);
     maybeAdaptLod(fps, now);
     frames=0; fpsT=now;

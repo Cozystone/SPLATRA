@@ -168,103 +168,13 @@ class TripoSRGenerator:
 
 
     def _splat_sigma(self, means: np.ndarray) -> float:
-        """Splat radius, measured from how far apart the points actually ended up.
-
-        Deriving it from the sampling grid was wrong in both directions: the cloud
-        gets carved to a shell and then thinned to ``n_points``, so the real gaps
-        between neighbours are nothing like one grid cell. Measure the median
-        nearest-neighbour distance instead and size each splat to cover it. Below
-        about 0.7x that distance the object fills with holes and the near-black
-        background reads through as noise; far above it the surface turns to mush.
-        """
-        n = means.shape[0]
-        if n < 32:
-            return 2.2 / self.grid
-        try:
-            from scipy.spatial import cKDTree
-            probe = means[np.random.default_rng(0).choice(n, min(4096, n), replace=False)]
-            d = cKDTree(means).query(probe, k=2)[0][:, 1]
-            nn = float(np.median(d[np.isfinite(d) & (d > 0)]))
-        except Exception:
-            nn = 2.2 / self.grid
-        return float(np.clip(nn * 0.75, 1.5 / self.grid, 0.06))
+        from .surface import splat_sigma
+        return splat_sigma(means, self.grid)
 
     def _surface_shell(self, pts: np.ndarray, cols: np.ndarray, step: float,
                        depth: int = 2) -> tuple:
-        """Keep the crust of the volume and drop what is buried inside it.
-
-        Thresholding the density field returns a *solid*: every voxel the object
-        occupies, not just the ones you can see. But TripoSR only ever learns
-        colour where a camera ray stops, so the colour it reports for a buried
-        voxel is unconstrained — muddy and dark. Those buried points outnumber the
-        visible surface several times over, and because a splat only a grid step
-        wide does not fully occlude what sits behind it, the view ends up looking
-        straight through the skin into that mush. That is the washed-out, dark,
-        noisy reading: the shell is right and everything behind it is garbage.
-
-        So erode the occupancy by ``depth`` voxels and keep only what the erosion
-        removes — a shell that still has thickness (so it survives being seen
-        edge-on) but no unsupervised interior. Hollowing also frees most of the
-        point budget for the surface, which is the only part anyone sees, and it
-        leaves the inside genuinely empty so composed interior parts show through
-        glass instead of being buried in filler.
-        """
-        if pts.shape[0] < 1000 or step <= 0:
-            return pts, cols
-        # index on the lattice the samples actually came from. Rescaling by the
-        # bounding box instead spreads neighbouring samples across several voxels,
-        # nothing ends up 6-connected, and every point looks like surface.
-        lo = pts.min(0)
-        vox = np.rint((pts - lo) / step).astype(np.int64)
-        K = int(vox.max()) + 1
-        vox = np.clip(vox, 0, K - 1) + 1
-        occ = np.zeros((K + 2, K + 2, K + 2), bool)
-        occ[vox[:, 0], vox[:, 1], vox[:, 2]] = True
-        inner = occ
-        for _ in range(max(1, int(depth))):          # 6-neighbour erosion
-            e = inner.copy()
-            for ax in (0, 1, 2):
-                for sh in (-1, 1):
-                    e &= np.roll(inner, sh, ax)
-            inner = e
-        keep = ~inner[vox[:, 0], vox[:, 1], vox[:, 2]]
-        # a thin or small object can be all surface (nothing to hollow) — and if
-        # the shell came out implausibly sparse, trust the solid rather than ship
-        # an object with holes in it
-        if keep.sum() < max(2000, pts.shape[0] * 0.02):
-            return pts, cols
-        return pts[keep], cols[keep]
-
-    def _label_parts(self, image_rgb, means) -> None:
-        """Teach every point which part of the object it belongs to.
-
-        The caller may set ``part_prompts`` (first entry = the whole object)
-        before generating; the planner's own part vocabulary is asked of the
-        source image via CLIPSeg, seeds are projected onto the cloud, and grown
-        through 3D space until every point belongs to a part. The result lands
-        on ``last_part_labels``/``last_part_names`` — one generation, one shell,
-        and the structure comes as labels instead of as bolted-on duplicates.
-        """
-        self.last_part_labels = None
-        self.last_part_names = []
-        self.last_forward_yaw = None
-        prompts = list(getattr(self, "part_prompts", []) or [])
-        if len(prompts) < 2:
-            return
-        try:
-            from ..structure.partlabel import label_from_image, propagate_labels
-            seeds = label_from_image(image_rgb, means, prompts)
-            if seeds is None or not (seeds >= 0).any():
-                return
-            self.last_part_labels = propagate_labels(means, seeds)
-            self.last_part_names = prompts
-            from ..structure.partlabel import forward_yaw_from_labels
-            self.last_forward_yaw = forward_yaw_from_labels(
-                means, self.last_part_labels, prompts)
-        except Exception:
-            self.last_part_labels = None
-            self.last_part_names = []
-
+        from .surface import surface_shell
+        return surface_shell(pts, cols, step, depth)
 
     def _apply_materials(self, image_rgb, means, opacities, colors):
         """Let a vision-language model decide what the surface is made of, then

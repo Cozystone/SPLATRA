@@ -76,3 +76,32 @@ def test_splat_size_follows_the_point_spacing() -> None:
 
     assert np.isclose(s_loose / s_tight, 2.0, rtol=0.05)
     assert 0.5 < s_tight / 0.01 < 1.0        # covers the gap without turning to mush
+
+
+def test_unpainted_shell_points_borrow_their_neighbours_colour() -> None:
+    """The hull paints only what some view faced; a roof between cameras stays
+    pure black. Black beside painted means unobserved, not black — borrow."""
+    from atanor_core.generation.surface import fill_dark_colors
+
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-1, 1, (4000, 3)).astype(np.float32)
+    cols = np.tile(np.array([0.7, 0.4, 0.2], np.float32), (4000, 1))
+    dark = pts[:, 1] > 0.5                     # the unobserved "roof"
+    cols[dark] = 0.0
+
+    out = fill_dark_colors(pts, cols)
+
+    assert np.allclose(out[dark], [0.7, 0.4, 0.2], atol=1e-5)
+    assert np.allclose(out[~dark], cols[~dark])
+
+
+def test_a_cloud_with_no_paint_is_not_painted_from_noise() -> None:
+    from atanor_core.generation.surface import fill_dark_colors
+
+    pts = np.random.default_rng(1).uniform(-1, 1, (3000, 3)).astype(np.float32)
+    cols = np.zeros((3000, 3), np.float32)
+    cols[:20] = 0.9                            # 0.7% lit: nothing worth spreading
+
+    out = fill_dark_colors(pts, cols)
+
+    assert np.allclose(out, cols)

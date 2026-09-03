@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..domain.sgf import GaussianField, rgb_to_sh_dc
+from ..domain.sgf import GaussianField, rgb_to_sh_dc, sh_dc_to_rgb
 
 
 def _quat_from_normal_np(n: np.ndarray) -> np.ndarray:
@@ -175,6 +175,28 @@ def carve_visual_hull(
     return GaussianField(means, scales, quats, opacities, sh, sh_degree=sh_degree)
 
 
+def _shell_and_paint(field: GaussianField, step: float) -> GaussianField:
+    """Carve the hull to its crust and rescue unpainted surface colour."""
+    from .surface import fill_dark_colors, surface_shell
+
+    pts = field.means
+    cols = sh_dc_to_rgb(field.sh[:, 0, :])
+    kept, kcols = surface_shell(pts, cols, step=step)
+    if kept.shape[0] == pts.shape[0]:
+        idx = np.arange(pts.shape[0])
+    else:
+        # surface_shell returns rows of the originals; recover their indices to
+        # keep the per-point scales/quats/opacities the carve computed
+        from scipy.spatial import cKDTree
+        idx = cKDTree(pts).query(kept, k=1)[1]
+    kcols = np.clip(fill_dark_colors(kept, np.clip(kcols, 0.0, 1.0)), 0.0, 1.0)
+    sh = field.sh[idx].copy()
+    sh[:, 0, :] = rgb_to_sh_dc(kcols.astype(np.float32))
+    return GaussianField(kept.astype(np.float32), field.scales[idx],
+                         field.quats[idx], field.opacities[idx], sh,
+                         sh_degree=field.sh_degree)
+
+
 def silhouette_score(field: GaussianField, masks: np.ndarray, azimuths,
                      elevations, scale: float = 1.2, S: int = 128) -> float:
     """Auto quality score (0-100) = mean silhouette IoU of the carved hull
@@ -298,6 +320,16 @@ class MultiViewGenerator:
         azr = np.radians(np.asarray(kept_az, np.float32)).astype(np.float32)
         elr = np.radians(np.asarray(kept_el, np.float32)).astype(np.float32)
         field = carve_visual_hull(masks, cols, azr, elr, grid=self.grid, scale=self.scale)
+        # The hull is a SOLID, and only its crust was ever painted — the carve
+        # zero-initialises colour and fills it only where some view looks at a
+        # voxel frontally, so the buried majority stays pure black (a composed
+        # all-round car measured 94.5% black points). Rendered, the crust does
+        # not fully occlude and the black interior reads straight through it.
+        # Worse, the fitter's colour anchor then pins those points to black and
+        # optimisation cannot save them. So do here exactly what the learned
+        # path does: keep the shell, and give any still-black shell point (a
+        # roof no camera faced) its nearest painted neighbour's colour.
+        field = _shell_and_paint(field, step=2.0 * self.scale / self.grid)
         # The hull is only an intersection of silhouettes — blunt, and its colour is
         # whichever view happened to be nearest. Use it as the starting point and
         # then optimise the Gaussians against every pixel of every view with our own

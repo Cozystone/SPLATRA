@@ -32,6 +32,7 @@ scatter-add, no custom CUDA, no build step.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -147,12 +148,14 @@ def _splat(means, colors, opacity, log_scale, quat, right, up, fwd, S, scale,
     acc = torch.zeros(S * S, device=dev)
     img.index_add_(0, idx, w.unsqueeze(1) * col.repeat_interleave(K, dim=0))
     acc.index_add_(0, idx, w)
-    # Premultiplied, NOT normalised by the accumulated weight. Dividing by acc
-    # discards exactly the quantity the display renderer composites with, so
-    # opacities tuned against a normalised image do not survive the round trip
-    # and the result draws wispy. Premultiplied means the parameters we optimise
-    # are the parameters that get drawn.
-    return img.view(S, S, 3), acc.view(S, S).clamp(0.0, 1.0)
+    # The accumulation is additive (no transmittance), so the raw weight sum is
+    # returned alongside: the colour loss must compare the weighted-AVERAGE
+    # colour (img/acc), never the raw sum. At hull densities the in-mask sum
+    # starts around 9 — matching THAT against a [0,1] target can only be done
+    # by crushing every colour toward black, which is exactly how the fit was
+    # repainting bright models dark. Coverage stays the clamped sum: that is
+    # what the alpha loss disciplines, and opacities keep their gradient there.
+    return img.view(S, S, 3), acc.view(S, S).clamp(0.0, 1.0), acc.view(S, S)
 
 
 def fit_gaussians(masks: np.ndarray, colors: np.ndarray, azimuths, elevations,
@@ -218,14 +221,31 @@ def fit_gaussians(masks: np.ndarray, colors: np.ndarray, azimuths, elevations,
         total = 0.0
         for v in range(V):
             r, u_, f = bases[v]
-            img, alpha = _splat(xyz, col.clamp(0, 1), torch.sigmoid(logit_a),
-                                log_s, quat, r, u_, f, S, scale)
+            img, alpha, accw = _splat(xyz, col.clamp(0, 1), torch.sigmoid(logit_a),
+                                      log_s, quat, r, u_, f, S, scale)
             m = tgt_a[v]
             l_a = torch.abs(alpha - m).mean()
-            # compare like with like: the target is premultiplied too
-            l_c = torch.abs(img - tgt_c[v] * m.unsqueeze(-1)).mean() * 3.0
+            # Compare COLOUR, not accumulation. The splatter returns an
+            # alpha-weighted sum whose in-mask level started at 9.25 for a
+            # hull-density init — matching that raw sum against a [0,1] target
+            # can only be done by crushing every colour and opacity toward
+            # black, which is precisely how the fit was repainting bright
+            # models dark (0.338 -> 0.071 mean colour, opacity 0.77 -> 0.41).
+            # Normalising by the accumulated weight makes the colour term
+            # measure colour alone; how much the splats cover is the alpha
+            # term's business, and only inside the silhouette gets a vote.
+            mw = m.unsqueeze(-1)
+            img_n = img / accw.unsqueeze(-1).clamp(min=1e-4)
+            l_c = (torch.abs(img_n - tgt_c[v]) * mw).sum() / (mw.sum() * 3.0 + 1e-6) * 3.0
             total = total + l_a + 0.8 * l_c
         total = total + 0.35 * torch.abs(col - col_anchor).mean()
+        if os.environ.get("SPLATRA_GSFIT_DEBUG") == "1" and it % 40 == 0:
+            with torch.no_grad():
+                mm = tgt_a[0] > 0.5
+                print("[fit %3d] col=%.3f anchor=%.3f | in-mask img=%.3f tgt=%.3f acc=%.3f | opa=%.3f"
+                      % (it, col.mean(), col_anchor.mean(), img[mm].mean(),
+                         tgt_c[0][mm].mean(), alpha[mm].mean(),
+                         torch.sigmoid(logit_a).mean()), flush=True)
         total.backward()
         opt.step()
         with torch.no_grad():
