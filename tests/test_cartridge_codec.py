@@ -133,3 +133,48 @@ def test_detail_ladder_is_clamped_to_what_the_gpu_can_hold() -> None:
     assert _max_detail_for_vram(5.0) == 2
     assert _max_detail_for_vram(3.5) == 1
     assert _max_detail_for_vram(None) == 5     # unknown GPU: do not punish it
+
+
+def test_spl4_interleaves_the_same_bytes_spl3_lays_out_planar() -> None:
+    """SPL4 exists so a partially downloaded cartridge is drawable: same 20
+    bytes per splat as SPL3, grouped per splat instead of per attribute. Any
+    record prefix must decode back to the first splats, exactly."""
+    from apps.plugin_api import _pack_cartridge_spl4
+
+    pos, col, scale, quat, opa = _fixture_arrays(257)   # crosses a texture row
+    blob = _pack_cartridge_spl4(pos, col, scale, quat, opa)
+
+    assert blob[:4] == b"SPL4"
+    n = struct.unpack("<I", blob[4:8])[0]
+    assert n == 257
+    assert len(blob) == 32 + n * 20
+    bb_min = np.frombuffer(blob, "<f4", 3, 8)
+    bb_max = np.frombuffer(blob, "<f4", 3, 20)
+    rec = np.frombuffer(blob, np.uint8, n * 20, 32).reshape(n, 20)
+
+    span = np.maximum(bb_max - bb_min, 1e-8)
+    pos_d = bb_min + ((rec[:, 0:6].copy().view("<i2").astype(np.float32) + 32768)
+                      / 65535.0) * span
+    col_d = rec[:, 6:9].astype(np.float32) / 255.0
+    opa_d = rec[:, 9].astype(np.float32) / 255.0
+    scale_d = rec[:, 10:16].copy().view("<f2").astype(np.float32)
+    quat_d = np.maximum(-1.0, rec[:, 16:20].copy().view(np.int8).astype(np.float32) / 127.0)
+
+    assert np.allclose(pos_d, pos, atol=2e-4)
+    assert np.allclose(col_d, col, atol=1/254)
+    assert np.allclose(opa_d, opa, atol=1/254)
+    assert np.allclose(scale_d, scale, rtol=1e-3, atol=1e-4)
+    qn = quat / np.linalg.norm(quat, axis=1, keepdims=True)
+    assert np.allclose(quat_d, qn, atol=1.2/127)
+
+    # a prefix of records IS the first k splats — the streaming contract
+    k = 40
+    prefix = np.frombuffer(blob, np.uint8, k * 20, 32).reshape(k, 20)
+    assert np.array_equal(prefix, rec[:k])
+
+
+def test_spl4_is_no_bigger_than_spl3() -> None:
+    from apps.plugin_api import _pack_cartridge_spl3, _pack_cartridge_spl4
+
+    arrays = _fixture_arrays(1000)
+    assert len(_pack_cartridge_spl4(*arrays)) == len(_pack_cartridge_spl3(*arrays))

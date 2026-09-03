@@ -844,13 +844,66 @@ def _pack_cartridge_spl3(pos, col, scale, quat, opa) -> bytes:
     )
 
 
+def _pack_cartridge_spl4(pos, col, scale, quat, opa) -> bytes:
+    """Pack a streamable SPL4 cartridge: SPL3's quantization, interleaved.
+
+    SPL3 lays the arrays out planar — every position, then every colour — so a
+    partially downloaded body is positions without colours: undrawable. SPL4
+    keeps the exact same 20 bytes per splat but groups them into per-splat
+    records, and the cartridge is already shuffled, so **any received byte
+    prefix is a fair, complete, drawable sample of the whole object**. A viewer
+    on a slow link shows the full object within the first chunks — coarse, via
+    the same cube-root size growth the LOD uses — and it simply refines as the
+    rest arrives.
+
+    Layout: magic "SPL4", uint32 N, bbox_min[3] fp32, bbox_max[3] fp32, then N
+    records of [pos int16x3 | col uint8x3 | opa uint8 | scale fp16x3 | quat
+    int8x4] = 20 bytes, offsets even so int16/fp16 stay aligned.
+    """
+    n = int(pos.shape[0])
+    pos = np.ascontiguousarray(pos, np.float32)
+    col = np.ascontiguousarray(np.clip(col, 0.0, 1.0), np.float32)
+    scale = np.ascontiguousarray(np.maximum(scale, 0.0), np.float32)
+    quat = np.ascontiguousarray(quat, np.float32)
+    opa = np.ascontiguousarray(np.clip(opa, 0.0, 1.0), np.float32)
+
+    bbox_min = pos.min(axis=0).astype(np.float32) if n else np.zeros(3, np.float32)
+    bbox_max = pos.max(axis=0).astype(np.float32) if n else np.ones(3, np.float32)
+    span = np.maximum(bbox_max - bbox_min, np.float32(1e-8))
+    pos_q = np.clip(np.rint(((pos - bbox_min) / span) * 65535.0 - 32768.0),
+                    -32768, 32767).astype("<i2", copy=False)
+    col_q = np.rint(col * 255.0).astype(np.uint8, copy=False)
+    opa_q = np.rint(opa * 255.0).astype(np.uint8, copy=False)
+    scale_q = scale.astype("<f2", copy=False)
+    q_norm = np.linalg.norm(quat, axis=1, keepdims=True)
+    q_norm = np.where(q_norm > 1e-8, q_norm, 1.0).astype(np.float32)
+    quat_q = np.rint(np.clip(quat / q_norm, -1.0, 1.0) * 127.0).astype(np.int8, copy=False)
+
+    rec = np.empty((n, 20), np.uint8)
+    rec[:, 0:6] = pos_q.view(np.uint8).reshape(n, 6)
+    rec[:, 6:9] = col_q.reshape(n, 3)
+    rec[:, 9] = opa_q
+    rec[:, 10:16] = scale_q.view(np.uint8).reshape(n, 6)
+    rec[:, 16:20] = quat_q.view(np.uint8).reshape(n, 4)
+    return (
+        b"SPL4"
+        + struct.pack("<I", n)
+        + bbox_min.astype("<f4", copy=False).tobytes()
+        + bbox_max.astype("<f4", copy=False).tobytes()
+        + rec.tobytes()
+    )
+
+
 @app.get("/v1/cartridge")
 def cartridge(format: str = "spl2", budget: Optional[int] = None) -> Response:
     if _engine.field is None:
         raise HTTPException(status_code=409, detail="nothing rendered yet")
     arrays = _shuffle_for_lod(*_apply_cartridge_budget(*_cartridge_arrays(), budget=budget))
     fmt = format.lower().strip()
-    if fmt == "spl3":
+    if fmt == "spl4":
+        blob = _pack_cartridge_spl4(*arrays)
+        out_format = "SPL4"
+    elif fmt == "spl3":
         blob = _pack_cartridge_spl3(*arrays)
         out_format = "SPL3"
     elif fmt == "spl2":

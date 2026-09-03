@@ -82,7 +82,7 @@
     <span class="pill" id="countPill">0 splats</span>
     <span class="pill" id="statePill">IDLE</span>
     <span class="pill" id="physPill">matter —</span>
-    <span class="pill" id="buildPill" title="build version">build lod-v22</span>
+    <span class="pill" id="buildPill" title="build version">build stream-v23</span>
   </div>
 </header>
 
@@ -992,12 +992,99 @@ function uploadModel(pos, col, scale, quat, opa){
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TEXW, texH, 0, gl.RGBA, gl.FLOAT, tex);
 
+  STREAM.n = 0;                       // planar upload: not a stream
   homePos = pos; COUNT = n;
   order = new Uint32Array(n); for(let i=0;i<n;i++) order[i]=i;
   depths = new Float32Array(n);
   lastSortKey = "";
   document.getElementById("countPill").textContent = `${n.toLocaleString()} splats · ${lastCartridgeFormat}`;
   setTimeout(loadMaterialSpec, 0);      // matter sim follows the geometry
+}
+
+// ================================================= streaming (SPL4) =========
+// The cartridge is shuffled server-side and SPL4 interleaves each splat into
+// one 20-byte record, so any received byte prefix is a fair, drawable sample
+// of the whole object. Streaming is therefore just LOD refinement over time:
+// the first chunks show the complete object coarse (splats grown by
+// cbrt(total/received), the same law the LOD governor uses), and it sharpens
+// as bytes arrive. No waiting for the download, no second upload pass.
+const STREAM = { n: 0 };            // n>0 while a stream is live/finished
+
+function streamBegin(n, min, span){
+  STREAM.n = n; STREAM.min = min; STREAM.span = span;
+  STREAM.pos = new Float32Array(n*3); STREAM.col = new Float32Array(n*3);
+  STREAM.scale = new Float32Array(n*3); STREAM.quat = new Float32Array(n*4);
+  STREAM.opa = new Float32Array(n);
+  STREAM.uploaded = 0;
+  STREAM.texH = Math.ceil(n*4 / TEXW);
+  modelFloorY = Infinity;
+  gl.bindTexture(gl.TEXTURE_2D, dataTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TEXW, STREAM.texH, 0, gl.RGBA, gl.FLOAT, null);
+  homePos = STREAM.pos; COUNT = 0;
+  order = new Uint32Array(n); depths = new Float32Array(n);
+  lastSortKey = "";
+}
+
+function decodeSPL4(u8, from, to){          // records [from,to) out of the byte buffer
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const {pos, col, scale, quat, opa, min, span} = STREAM;
+  for(let i=from;i<to;i++){
+    const o = 32 + i*20;
+    for(let a=0;a<3;a++)
+      pos[3*i+a] = min[a] + ((dv.getInt16(o+2*a, true) + 32768) / 65535) * span[a];
+    col[3*i] = u8[o+6]/255; col[3*i+1] = u8[o+7]/255; col[3*i+2] = u8[o+8]/255;
+    opa[i] = u8[o+9]/255;
+    for(let a=0;a<3;a++) scale[3*i+a] = halfToFloat(dv.getUint16(o+10+2*a, true));
+    for(let a=0;a<4;a++) quat[4*i+a] = Math.max(-1, dv.getInt8(o+16+a)/127);
+    if(pos[3*i+1] < modelFloorY) modelFloorY = pos[3*i+1];
+  }
+}
+
+const SPLATS_PER_ROW = TEXW/4;              // 4 texels per splat
+function streamCommit(decoded){
+  // upload whole texture rows [rowOf(uploaded) .. ceil(decoded/row)); the tail
+  // of the last row may hold not-yet-decoded splats — they sit beyond COUNT so
+  // nothing reads them, and the next commit rewrites the row anyway
+  const n = STREAM.n;
+  const row0 = (STREAM.uploaded / SPLATS_PER_ROW) | 0;
+  const row1 = Math.min(STREAM.texH, Math.ceil(decoded / SPLATS_PER_ROW));
+  if(row1 <= row0 && decoded < n) return;
+  const i0 = row0 * SPLATS_PER_ROW, i1 = Math.min(n, row1 * SPLATS_PER_ROW);
+  const batch = new Float32Array((i1 - i0) * 16);
+  const {pos, col, scale, quat, opa} = STREAM;
+  for(let i=i0;i<i1;i++){
+    const k = Math.min(i, decoded - 1);     // undecoded tail: repeat the last splat
+    let w=quat[4*k], x=quat[4*k+1], y=quat[4*k+2], z=quat[4*k+3];
+    const ql=Math.hypot(w,x,y,z)||1; w/=ql; x/=ql; y/=ql; z/=ql;
+    const sx=scale[3*k], sy=scale[3*k+1], sz=scale[3*k+2];
+    const r00=1-2*(y*y+z*z), r01=2*(x*y-w*z), r02=2*(x*z+w*y);
+    const r10=2*(x*y+w*z),   r11=1-2*(x*x+z*z), r12=2*(y*z-w*x);
+    const r20=2*(x*z-w*y),   r21=2*(y*z+w*x),   r22=1-2*(x*x+y*y);
+    const sx2=sx*sx, sy2=sy*sy, sz2=sz*sz;
+    const c00=r00*r00*sx2 + r01*r01*sy2 + r02*r02*sz2;
+    const c01=r00*r10*sx2 + r01*r11*sy2 + r02*r12*sz2;
+    const c02=r00*r20*sx2 + r01*r21*sy2 + r02*r22*sz2;
+    const c11=r10*r10*sx2 + r11*r11*sy2 + r12*r12*sz2;
+    const c12=r10*r20*sx2 + r11*r21*sy2 + r12*r22*sz2;
+    const c22=r20*r20*sx2 + r21*r21*sy2 + r22*r22*sz2;
+    const o=(i-i0)*16;
+    batch[o+0]=pos[3*k]; batch[o+1]=pos[3*k+1]; batch[o+2]=pos[3*k+2]; batch[o+3]=opa[k];
+    batch[o+4]=col[3*k]; batch[o+5]=col[3*k+1]; batch[o+6]=col[3*k+2]; batch[o+7]=0;
+    batch[o+8]=c00; batch[o+9]=c01; batch[o+10]=c02; batch[o+11]=0;
+    batch[o+12]=c11; batch[o+13]=c12; batch[o+14]=c22; batch[o+15]=0;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, dataTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, row0, TEXW, row1-row0, gl.RGBA, gl.FLOAT, batch);
+  STREAM.uploaded = i1;
+  COUNT = Math.min(decoded, i1);
+  lastSortKey = "";
+  document.getElementById("countPill").textContent =
+    COUNT < n ? `${COUNT.toLocaleString()}/${n.toLocaleString()} streaming…`
+              : `${n.toLocaleString()} splats · SPL4`;
 }
 
 // ====================================================== depth sort (16-bit) =
@@ -1094,7 +1181,7 @@ function frame(){
       gl.uniform1f(U.uBlink, blink);
     } else { gl.uniform1i(U.uNEye, 0); gl.uniform1f(U.uBlink, 0); }
     gl.uniform1f(U.uFloorY, modelFloorY);
-    gl.uniform1f(U.uLodGrow, Math.pow(COUNT/lodDrawN(), 2/3));
+    gl.uniform1f(U.uLodGrow, Math.pow(Math.max(COUNT, STREAM.n||0)/lodDrawN(), 2/3));
     gl.uniform1f(U.uMaxQuad, LOD.maxQuad);
     if (PHYS.ready && PHYS.on) {
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, PHYS.bindTex);
@@ -1275,7 +1362,7 @@ function parseSPL3(b, dv){
 
 function cartridgeUrl(){
   const sep = API.includes("?") ? "&" : "?";
-  return `${API}/v1/cartridge${sep}format=spl3&budget=${Math.max(1, cartridgeBudget|0)}&_=${Date.now()}`;
+  return `${API}/v1/cartridge${sep}format=spl4&budget=${Math.max(1, cartridgeBudget|0)}&_=${Date.now()}`;
 }
 
 function governLod(fps){
@@ -1307,20 +1394,88 @@ function maybeAdaptLod(fps, now){
   }
 }
 
+function _arriveAnim(animate){
+  if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700); swirlSettle(1700);  // another half-turn in, same direction
+    if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
+}
+
 async function loadCartridge(animate=true, url=null){
   if(cartridgeLoading) return;
   cartridgeLoading = true;
   try{
     const u = url || cartridgeUrl();
-    const b = await (await fetch(u)).arrayBuffer();
-    const dv = new DataView(b);
-    const magic = magicOf(dv);
-    if(magic !== "SPL2" && magic !== "SPL3") throw new Error(`unknown cartridge format ${magic}`);
-    const parsed = magic === "SPL3" ? parseSPL3(b, dv) : parseSPL2(b, dv);
-    const {pos,col,scale,quat,opa} = parsed;
-    uploadModel(pos,col,scale,quat,opa);
-    if(animate && anim.mode!=="cycle"){ anim.t=0; tween(1,1700); swirlSettle(1700);  // another half-turn in, same direction
-      if(_baseDist!=null){ camTo(yaw, pitch, _baseDist, 1700); _baseDist=null; } }   // zoom back in as it reassembles
+    const resp = await fetch(u);
+    if(!resp.ok) throw new Error(`cartridge ${resp.status}`);
+    const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+    if(reader){
+      // progressive path: bytes -> records -> texture rows, painting as we go
+      let buf = new Uint8Array(1 << 16), len = 0, header = null, decoded = 0, first = true;
+      const grow = need => { if(need <= buf.length) return;
+        let cap = buf.length; while(cap < need) cap *= 2;
+        const nb = new Uint8Array(cap); nb.set(buf.subarray(0, len)); buf = nb; };
+      for(;;){
+        const {done, value} = await reader.read();
+        if(value){ grow(len + value.length); buf.set(value, len); len += value.length; }
+        if(!header && len >= 32){
+          const magic = String.fromCharCode(buf[0], buf[1], buf[2], buf[3]);
+          if(magic !== "SPL4"){                       // legacy server: buffer it all
+            while(true){ const r = await reader.read(); if(r.done) break;
+              grow(len + r.value.length); buf.set(r.value, len); len += r.value.length; }
+            const b = buf.buffer.slice(buf.byteOffset, buf.byteOffset + len);
+            const dv = new DataView(b);
+            if(magic !== "SPL2" && magic !== "SPL3") throw new Error(`unknown cartridge format ${magic}`);
+            const {pos,col,scale,quat,opa} = magic === "SPL3" ? parseSPL3(b, dv) : parseSPL2(b, dv);
+            uploadModel(pos,col,scale,quat,opa);
+            _arriveAnim(animate);
+            break;
+          }
+          const dv = new DataView(buf.buffer);
+          const n = dv.getUint32(4, true);
+          const mn=[dv.getFloat32(8,true), dv.getFloat32(12,true), dv.getFloat32(16,true)];
+          const mx=[dv.getFloat32(20,true), dv.getFloat32(24,true), dv.getFloat32(28,true)];
+          const span=[Math.max(1e-8,mx[0]-mn[0]), Math.max(1e-8,mx[1]-mn[1]), Math.max(1e-8,mx[2]-mn[2])];
+          streamBegin(n, mn, span);
+          lastCartridgeFormat = "SPL4";
+          header = true;
+        }
+        if(header){
+          const avail = Math.min(STREAM.n, ((len - 32) / 20) | 0);
+          if(avail > decoded){
+            decodeSPL4(buf, decoded, avail); decoded = avail;
+            // commit in ~8k-splat steps: early paint without drowning in uploads
+            if(done || decoded === STREAM.n || decoded - STREAM.uploaded >= 8192){
+              streamCommit(decoded);
+              if(first && COUNT > 0){ first = false; _arriveAnim(animate); }
+            }
+          }
+        }
+        if(done){ if(header && decoded < STREAM.n){ STREAM.n = decoded; streamCommit(decoded); } break; }
+      }
+      if(lastCartridgeFormat === "SPL4"){
+        document.getElementById("countPill").textContent =
+          `${COUNT.toLocaleString()} splats · SPL4`;
+        setTimeout(loadMaterialSpec, 0);
+      }
+    } else {
+      const b = await resp.arrayBuffer();
+      const dv = new DataView(b);
+      const magic = magicOf(dv);
+      if(magic !== "SPL2" && magic !== "SPL3" && magic !== "SPL4") throw new Error(`unknown cartridge format ${magic}`);
+      if(magic === "SPL4"){
+        const u8 = new Uint8Array(b);
+        const n = dv.getUint32(4, true);
+        const mn=[dv.getFloat32(8,true), dv.getFloat32(12,true), dv.getFloat32(16,true)];
+        const mx=[dv.getFloat32(20,true), dv.getFloat32(24,true), dv.getFloat32(28,true)];
+        const span=[Math.max(1e-8,mx[0]-mn[0]), Math.max(1e-8,mx[1]-mn[1]), Math.max(1e-8,mx[2]-mn[2])];
+        streamBegin(n, mn, span); decodeSPL4(u8, 0, n); streamCommit(n);
+        lastCartridgeFormat = "SPL4";
+        setTimeout(loadMaterialSpec, 0);
+      } else {
+        const {pos,col,scale,quat,opa} = magic === "SPL3" ? parseSPL3(b, dv) : parseSPL2(b, dv);
+        uploadModel(pos,col,scale,quat,opa);
+      }
+      _arriveAnim(animate);
+    }
     fetchRig();     // ask the server for this model's learned rig (null if none)
   } finally {
     cartridgeLoading = false;
