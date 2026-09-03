@@ -245,6 +245,7 @@ class TripoSRGenerator:
         """
         self.last_part_labels = None
         self.last_part_names = []
+        self.last_forward_yaw = None
         prompts = list(getattr(self, "part_prompts", []) or [])
         if len(prompts) < 2:
             return
@@ -255,6 +256,9 @@ class TripoSRGenerator:
                 return
             self.last_part_labels = propagate_labels(means, seeds)
             self.last_part_names = prompts
+            from ..structure.partlabel import forward_yaw_from_labels
+            self.last_forward_yaw = forward_yaw_from_labels(
+                means, self.last_part_labels, prompts)
         except Exception:
             self.last_part_labels = None
             self.last_part_names = []

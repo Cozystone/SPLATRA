@@ -1746,6 +1746,7 @@ def scene_clear() -> Dict[str, Any]:
 def scene_list() -> Dict[str, Any]:
     return {"version": _scene.version,
             "objects": [{"id": o.id, "position": o.position.tolist(),
+                         "rotation": [round(float(v), 4) for v in o.rotation],
                          "scale": o.scale, "label": o.label,
                          "num_gaussians": o.field.num_gaussians}
                         for o in _scene.objects.values()],
@@ -2023,6 +2024,48 @@ class ComposeRequest(BaseModel):
     quality: str = "fast"          # "full" = all-round multi-view per part
 
 
+def _quat_mul_wxyz(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array([
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw], np.float32)
+
+
+def _facing_quat(facing: str, tilt_deg: float = 0.0,
+                 shell_yaw: float = 0.0) -> np.ndarray:
+    """The rotation that points a generated part the way it belongs.
+
+    Every part comes out of the image lift facing the camera — its front is +z,
+    its up is +y — because its source image is a front view. But a steering
+    wheel faces the driver, not the windscreen, and a seat faces wherever the
+    car is going. The planner says which (facing + a tilt for things like a
+    steering column), and ``shell_yaw`` rotates the whole arrangement to the
+    forward axis actually measured on the shell's labelled anatomy, so a
+    3/4-view reconstruction gets its furniture turned with it.
+
+    Returns a (w,x,y,z) quaternion for :class:`SceneObject.rotation`.
+    """
+    yaw_by_facing = {"forward": 0.0, "backward": np.pi,
+                     "right": np.pi / 2.0, "left": -np.pi / 2.0}
+    pitch_by_facing = {"up": -np.pi / 2.0, "down": np.pi / 2.0}
+    yaw = float(shell_yaw) + yaw_by_facing.get(str(facing), 0.0)
+    pitch = pitch_by_facing.get(str(facing), 0.0) - np.deg2rad(float(tilt_deg or 0.0))
+    qy = np.array([np.cos(yaw / 2), 0.0, np.sin(yaw / 2), 0.0], np.float32)
+    qx = np.array([np.cos(pitch / 2), np.sin(pitch / 2), 0.0, 0.0], np.float32)
+    q = _quat_mul_wxyz(qy, qx)          # tilt in the part's own frame, then aim it
+    return (q / (np.linalg.norm(q) + 1e-9)).astype(np.float32)
+
+
+def _yaw_rotate_at(at, yaw: float):
+    """Swing a planned position around +y by the measured forward yaw."""
+    c, si = float(np.cos(yaw)), float(np.sin(yaw))
+    x, y, z = float(at[0]), float(at[1]), float(at[2])
+    return [c * x + si * z, y, -si * x + c * z]
+
+
 def _collapse_exterior(parts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """One labelled shell instead of a fleet of bolted-on exterior parts.
 
@@ -2219,7 +2262,9 @@ def compose_object(req: ComposeRequest) -> Dict[str, Any]:
                     if q == "full" and float(part["scale"]) < biggest - 1e-6:
                         q = "fast"          # only the shell gets all-round
                     _t0 = time.time()
-                    cache[key] = _gen_object(part["prompt"], q)[0]
+                    p_now = part["prompt"] + (
+                        ", front view" if part.get("layer") != "exterior" else "")
+                    cache[key] = _gen_object(p_now, q)[0]
                     timing.record(_timing_key(q, req.detail, float(part["scale"])),
                                   time.time() - _t0)
                 finally:
@@ -2242,11 +2287,22 @@ def compose_object(req: ComposeRequest) -> Dict[str, Any]:
                     _compose_state["part_counts"] = {
                         gen.last_part_names[i]: int((lab == i).sum())
                         for i in range(len(gen.last_part_names)) if (lab == i).any()}
+                    _compose_state["forward_yaw"] = getattr(gen, "last_forward_yaw", None)
             except Exception:
                 pass
         oid = _slug(part["name"]) or part["name"]
+        at = part["at"]
+        rot = np.array([1, 0, 0, 0], np.float32)
+        if part.get("layer") != "exterior":
+            # a generated part faces the camera (+z); aim it the way the plan
+            # says it faces, in the forward frame measured on the shell itself
+            fwd = float(_compose_state.get("forward_yaw") or 0.0)
+            rot = _facing_quat(part.get("facing", "forward"),
+                               part.get("tilt", 0.0), shell_yaw=fwd)
+            at = _yaw_rotate_at(at, fwd)
         _scene.add(SceneObject(id=oid, field=field,
-                               position=np.array(part["at"], np.float32),
+                               position=np.array(at, np.float32),
+                               rotation=rot,
                                scale=float(part["scale"]), label=part["name"]))
         _compose_state["layers"][oid] = part["layer"]
         built.append({"name": part["name"], "id": oid, "layer": part["layer"],

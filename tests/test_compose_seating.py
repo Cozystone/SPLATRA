@@ -210,3 +210,58 @@ def test_part_alignment_recovers_a_yaw_and_the_shells_proportions() -> None:
     union = np.concatenate(aligned)
     assert np.allclose(union.min(0), shell.min(0), atol=0.08)
     assert np.allclose(union.max(0), shell.max(0), atol=0.08)
+
+
+def test_facing_quat_aims_a_camera_facing_part() -> None:
+    """Generated parts face +z. The quaternion must aim that front where the
+    plan says it belongs — a steering wheel backward at the driver, a bed's
+    face up — and swing everything by the yaw measured on the shell."""
+    from apps.plugin_api import _facing_quat
+    from atanor_core.domain.scene import _quat_to_rot
+
+    front = np.array([0, 0, 1], np.float32)
+
+    f = _quat_to_rot(_facing_quat("forward")) @ front
+    assert np.allclose(f, [0, 0, 1], atol=1e-5)
+    b = _quat_to_rot(_facing_quat("backward")) @ front
+    assert np.allclose(b, [0, 0, -1], atol=1e-5)
+    u = _quat_to_rot(_facing_quat("up")) @ front
+    assert np.allclose(u, [0, 1, 0], atol=1e-5)
+    r = _quat_to_rot(_facing_quat("right")) @ front
+    assert np.allclose(r, [1, 0, 0], atol=1e-5)
+
+    # tilt pitches the face upward: backward + 22deg looks back and up a bit
+    t = _quat_to_rot(_facing_quat("backward", 22.0)) @ front
+    assert t[2] < -0.85 and t[1] > 0.3
+
+    # the measured shell yaw swings the whole aim with the body
+    y = _quat_to_rot(_facing_quat("forward", 0.0, shell_yaw=np.pi/2)) @ front
+    assert np.allclose(y, [1, 0, 0], atol=1e-5)
+
+
+def test_forward_yaw_is_read_off_the_labelled_anatomy() -> None:
+    """Headlights sit on the front of a car; the direction from the cloud's
+    centre to the headlight group IS the forward axis."""
+    from atanor_core.structure.partlabel import forward_yaw_from_labels
+
+    rng = np.random.default_rng(0)
+    body = rng.normal(0, 0.4, (5000, 3)).astype(np.float32)
+    lights = (rng.normal(0, 0.05, (1200, 3)) + [0.9, 0.0, 0.0]).astype(np.float32)
+    means = np.concatenate([body, lights])
+    labels = np.zeros(means.shape[0], np.int32)
+    labels[5000:] = 1
+
+    yaw = forward_yaw_from_labels(means, labels, ["a car", "headlight"])
+
+    assert yaw is not None and abs(yaw - np.pi/2) < 0.1   # forward is +x
+
+    # nothing front-mounted labelled -> honestly unknown, not a guess
+    assert forward_yaw_from_labels(means, labels, ["a car", "wheel"]) is None
+
+
+def test_unoriented_plan_parts_get_a_semantic_default() -> None:
+    from atanor_core.structure.decompose import _default_facing
+
+    assert _default_facing("steering wheel", "steering wheel") == ("backward", 22.0)
+    assert _default_facing("seats1", "car seat") == ("forward", 0.0)
+    assert _default_facing("engine block", "car engine") == ("forward", 0.0)

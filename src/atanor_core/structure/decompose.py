@@ -56,7 +56,8 @@ _SYS = (
     '"prompt":"<one concrete object, '
     'in English, that can be generated on its own>","where":"<anchor>",'
     '"count":<1|2|4>,"scale":<0.05..1.0>,'
-    '"layer":"<exterior|interior|structure>"}]}. '
+    '"layer":"<exterior|interior|structure>",'
+    '"facing":"<forward|backward|left|right|up|down>"}]}. '
     "where must be one of: " + _ANCHOR_WORDS + ". Use count 2 with where=sides for "
     "a symmetric pair, and count 4 with where=bottom-corners for wheels or legs. "
     "scale is the part's size relative to the whole. Give 3-8 parts. The outer "
@@ -64,8 +65,10 @@ _SYS = (
     "you would only see by opening the object is interior; load-bearing frames are "
     "structure. Example for a car: body shell (exterior, center, 1.0), wheels "
     "(exterior, bottom-corners, count 4, 0.22), seats (interior, sides, count 2, "
-    "0.2), steering wheel (interior, front, 0.12), engine block (interior, "
-    "front-bottom, 0.3). "
+    "0.2, facing forward), steering wheel (interior, front, 0.12, facing "
+    "backward — it faces the driver), engine block (interior, front-bottom, "
+    "0.3). facing is the direction the part's FRONT points inside the object "
+    "(forward = toward the object's front). "
     "has_interior is true only when the object has a designed inside you "
     "cannot see from outside — a car (cabin, engine), a computer (boards), "
     "a building (rooms), a camera (sensor, mirror). It is false for solid "
@@ -182,6 +185,33 @@ def _tighten(prompt: str, name: str) -> str:
     return (nm or q)[:80]
 
 
+_FACINGS = ("forward", "backward", "left", "right", "up", "down")
+
+# what a part faces when the planner does not say — the vocabulary of things
+# that have an obvious inside-the-object orientation
+_FACING_BY_NAME = (
+    ("steering", ("backward", 22.0)),   # faces the driver, tilted up a little
+    ("dashboard", ("backward", 0.0)),
+    ("instrument", ("backward", 0.0)),
+    ("seat", ("forward", 0.0)),
+    ("sofa", ("forward", 0.0)),
+    ("bench", ("forward", 0.0)),
+    ("screen", ("forward", 0.0)),
+    ("monitor", ("forward", 0.0)),
+    ("bed", ("up", 0.0)),
+    ("pedal", ("backward", 45.0)),
+)
+
+
+def _default_facing(name: str, prompt: str):
+    """(facing, tilt-degrees) for a part the planner left unoriented."""
+    text = ("%s %s" % (name, prompt)).lower()
+    for key, val in _FACING_BY_NAME:
+        if key in text:
+            return val
+    return ("forward", 0.0)
+
+
 def _sanitize(data: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(data, dict):
         return None
@@ -205,8 +235,17 @@ def _sanitize(data: Any) -> Optional[Dict[str, Any]]:
         except Exception:
             cnt = 1
         nm = str(r.get("name", "part"))[:24]
-        parts.extend(_expand(nm, _tighten(q, nm), where, cnt, scale,
-                             _infer_layer(nm, q, layer)))
+        facing = str(r.get("facing", "")).strip().lower()
+        tilt = 0.0
+        if facing not in _FACINGS:
+            facing, tilt = _default_facing(nm, q)
+        elif "steering" in (nm + " " + q).lower():
+            tilt = 22.0                       # semantic detail the schema omits
+        expanded = _expand(nm, _tighten(q, nm), where, cnt, scale,
+                           _infer_layer(nm, q, layer))
+        for e in expanded:
+            e["facing"], e["tilt"] = facing, tilt
+        parts.extend(expanded)
     if not parts:
         return None
     return {"object": str(data.get("object", "object"))[:40],

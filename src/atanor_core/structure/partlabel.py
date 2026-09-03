@@ -304,3 +304,35 @@ def propagate_labels(points: np.ndarray, labels: np.ndarray,
         lab[grow] = best[grow]
     lab[lab < 0] = 0
     return lab
+
+
+_FRONT_WORDS = ("headlight", "grille", "windshield", "windscreen", "face",
+                "nose", "mouth", "eyes", "beak", "door", "screen")
+
+
+def forward_yaw_from_labels(means: np.ndarray, labels: np.ndarray,
+                            names: List[str]) -> Optional[float]:
+    """Which way does the object actually face? Ask its own labelled anatomy.
+
+    Interior parts are placed and oriented assuming the object faces +z, but a
+    3/4-view source image gives the reconstruction a diagonal forward. Labels
+    that are semantically front-mounted — headlights, a grille, a face — sit on
+    the true front, so the horizontal direction from the cloud's centre to such
+    a group IS the forward axis. Returns the yaw (radians about +y, 0 = +z) or
+    None when nothing front-mounted was labelled confidently.
+    """
+    if labels is None or not names:
+        return None
+    centre = means.mean(0)
+    for i, name in enumerate(names):
+        low = str(name).lower()
+        if not any(w in low for w in _FRONT_WORDS):
+            continue
+        m = labels == i
+        if int(m.sum()) < 800:
+            continue
+        v = means[m].mean(0) - centre
+        if float(np.hypot(v[0], v[2])) < 0.12:      # front-ish but not lateral
+            continue
+        return float(np.arctan2(v[0], v[2]))
+    return None
